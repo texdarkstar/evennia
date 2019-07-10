@@ -12,35 +12,36 @@ There are two similar but separate stores of sessions:
          handle network communication but holds no game info.
 
 """
+import time
 from builtins import object
 from future.utils import listvalues
 
-from time import time
 from django.conf import settings
 from evennia.commands.cmdhandler import CMD_LOGINSTART
 from evennia.utils.logger import log_trace
 from evennia.utils.utils import (variable_from_module, is_iter,
-                                 to_str, to_unicode,
-                                 make_iter,
-                                 callables_from_module)
+                                 make_iter, delay, callables_from_module)
+from evennia.server.signals import SIGNAL_ACCOUNT_POST_LOGIN, SIGNAL_ACCOUNT_POST_LOGOUT
+from evennia.server.signals import SIGNAL_ACCOUNT_POST_FIRST_LOGIN, SIGNAL_ACCOUNT_POST_LAST_LOGOUT
 from evennia.utils.inlinefuncs import parse_inlinefunc
-
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+from codecs import decode as codecs_decode
 
 _INLINEFUNC_ENABLED = settings.INLINEFUNC_ENABLED
 
 # delayed imports
-_PlayerDB = None
+_AccountDB = None
 _ServerSession = None
 _ServerConfig = None
 _ScriptDB = None
 _OOB_HANDLER = None
 
+_ERR_BAD_UTF8 = 'Your client sent an incorrect UTF-8 sequence.'
+
+
 class DummySession(object):
     sessid = 0
+
+
 DUMMYSESSION = DummySession()
 
 # AMP signals
@@ -54,7 +55,13 @@ SSHUTD = chr(7)       # server shutdown
 SSYNC = chr(8)        # server session sync
 SCONN = chr(11)        # server portal connection (for bots)
 PCONNSYNC = chr(12)   # portal post-syncing session
-PDISCONNALL = chr(13) # portal session discnnect all
+PDISCONNALL = chr(13)  # portal session discnnect all
+SRELOAD = chr(14)      # server reloading (have portal start a new server)
+SSTART = chr(15)       # server start (portal must already be running anyway)
+PSHUTD = chr(16)       # portal (+server) shutdown
+SSHUTD = chr(17)       # server shutdown
+PSTATUS = chr(18)      # ping server or portal status
+SRESET = chr(19)       # server shutdown in reset mode
 
 # i18n
 from django.utils.translation import ugettext as _
@@ -62,6 +69,7 @@ from django.utils.translation import ugettext as _
 _SERVERNAME = settings.SERVERNAME
 _MULTISESSION_MODE = settings.MULTISESSION_MODE
 _IDLE_TIMEOUT = settings.IDLE_TIMEOUT
+_DELAY_CMD_LOGINSTART = settings.DELAY_CMD_LOGINSTART
 _MAX_SERVER_COMMANDS_PER_SECOND = 100.0
 _MAX_SESSION_COMMANDS_PER_SECOND = 5.0
 _MODEL_MAP = None
@@ -72,24 +80,28 @@ _INPUT_FUNCS = {}
 for modname in make_iter(settings.INPUT_FUNC_MODULES):
     _INPUT_FUNCS.update(callables_from_module(modname))
 
+
 def delayed_import():
     """
     Helper method for delayed import of all needed entities.
 
     """
-    global _ServerSession, _PlayerDB, _ServerConfig, _ScriptDB
+    global _ServerSession, _AccountDB, _ServerConfig, _ScriptDB
     if not _ServerSession:
         # we allow optional arbitrary serversession class for overloading
         modulename, classname = settings.SERVER_SESSION_CLASS.rsplit(".", 1)
         _ServerSession = variable_from_module(modulename, classname)
-    if not _PlayerDB:
-        from evennia.players.models import PlayerDB as _PlayerDB
+    if not _AccountDB:
+        from evennia.accounts.models import AccountDB as _AccountDB
     if not _ServerConfig:
         from evennia.server.models import ServerConfig as _ServerConfig
     if not _ScriptDB:
         from evennia.scripts.models import ScriptDB as _ScriptDB
     # including once to avoid warnings in Python syntax checkers
-    _ServerSession, _PlayerDB, _ServerConfig, _ScriptDB
+    assert(_ServerSession)
+    assert(_AccountDB)
+    assert(_ServerConfig)
+    assert(_ScriptDB)
 
 
 #-----------------------------------------------------------
@@ -101,6 +113,28 @@ class SessionHandler(dict):
     This handler holds a stack of sessions.
 
     """
+
+    def __getitem__(self, key):
+        "Clean out None-sessions automatically."
+        if None in self:
+            del self[None]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        "Clean out None-sessions automatically."
+        if None in self:
+            del self[None]
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        "Don't assign None sessions"
+        if key is not None:
+            super().__setitem__(key, value)
+
+    def __contains__(self, key):
+        "None-keys are not accepted."
+        return False if key is None else super().__contains__(key)
+
     def get_sessions(self, include_unloggedin=False):
         """
         Returns the connected session objects.
@@ -156,6 +190,21 @@ class SessionHandler(dict):
         raw = options.get("raw", False)
         strip_inlinefunc = options.get("strip_inlinefunc", False)
 
+        def _utf8(data):
+            if isinstance(data, bytes):
+                try:
+                    data = codecs_decode(data, session.protocol_flags["ENCODING"])
+                except LookupError:
+                    # wrong encoding set on the session. Set it to a safe one
+                    session.protocol_flags["ENCODING"] = "utf-8"
+                    data = codecs_decode(data, "utf-8")
+                except UnicodeDecodeError:
+                    # incorrect unicode sequence
+                    session.sendLine(_ERR_BAD_UTF8)
+                    data = ''
+
+            return data
+
         def _validate(data):
             "Helper function to convert data to AMP-safe (picketable) values"
             if isinstance(data, dict):
@@ -163,54 +212,54 @@ class SessionHandler(dict):
                 for key, part in data.items():
                     newdict[key] = _validate(part)
                 return newdict
-            elif hasattr(data, "__iter__"):
+            elif is_iter(data):
                 return [_validate(part) for part in data]
-            elif isinstance(data, basestring):
-                # make sure strings are in a valid encoding
-                try:
-                    data = data and to_str(to_unicode(data), encoding=session.protocol_flags["ENCODING"])
-                except LookupError:
-                    # wrong encoding set on the session. Set it to a safe one
-                    session.protocol_flags["ENCODING"] = "utf-8"
-                    data = to_str(to_unicode(data), encoding=session.protocol_flags["ENCODING"])
+            elif isinstance(data, (str, bytes)):
+                data = _utf8(data)
+
                 if _INLINEFUNC_ENABLED and not raw and isinstance(self, ServerSessionHandler):
                     # only parse inlinefuncs on the outgoing path (sessionhandler->)
                     data = parse_inlinefunc(data, strip=strip_inlinefunc, session=session)
-                return data
+
+                return str(data)
             elif hasattr(data, "id") and hasattr(data, "db_date_created") \
                     and hasattr(data, '__dbclass__'):
                 # convert database-object to their string representation.
-                return _validate(unicode(data))
+                return _validate(str(data))
             else:
                 return data
 
         rkwargs = {}
-        for key, data in kwargs.iteritems():
+        for key, data in kwargs.items():
             key = _validate(key)
             if not data:
-                rkwargs[key] = [ [], {} ]
+                if key == "text":
+                    # we don't allow sending text = None, this must mean
+                    # that the text command is not to be used.
+                    continue
+                rkwargs[key] = [[], {}]
             elif isinstance(data, dict):
-                rkwargs[key] = [ [], _validate(data) ]
-            elif hasattr(data, "__iter__"):
+                rkwargs[key] = [[], _validate(data)]
+            elif is_iter(data):
                 if isinstance(data[-1], dict):
                     if len(data) == 2:
-                        if hasattr(data[0], "__iter__"):
+                        if is_iter(data[0]):
                             rkwargs[key] = [_validate(data[0]), _validate(data[1])]
                         else:
                             rkwargs[key] = [[_validate(data[0])], _validate(data[1])]
                     else:
-                        rkwargs[key] = [ _validate(data[:-1]), _validate(data[-1]) ]
+                        rkwargs[key] = [_validate(data[:-1]), _validate(data[-1])]
                 else:
-                    rkwargs[key] = [ _validate(data), {} ]
+                    rkwargs[key] = [_validate(data), {}]
             else:
-                rkwargs[key] = [ [_validate(data)], {} ]
+                rkwargs[key] = [[_validate(data)], {}]
             rkwargs[key][1]["options"] = options
         return rkwargs
 
 
-#------------------------------------------------------------
+# ------------------------------------------------------------
 # Server-SessionHandler class
-#------------------------------------------------------------
+# ------------------------------------------------------------
 
 class ServerSessionHandler(SessionHandler):
     """
@@ -220,7 +269,7 @@ class ServerSessionHandler(SessionHandler):
     A session register with the handler in two steps, first by
     registering itself with the connect() method. This indicates an
     non-authenticated session. Whenever the session is authenticated
-    the session together with the related player is sent to the login()
+    the session together with the related account is sent to the login()
     method.
 
     """
@@ -232,9 +281,20 @@ class ServerSessionHandler(SessionHandler):
         Init the handler.
 
         """
-        super(ServerSessionHandler, self).__init__(*args, **kwargs)
-        self.server = None
+        super().__init__(*args, **kwargs)
+        self.server = None  # set at server initialization
         self.server_data = {"servername": _SERVERNAME}
+        # will be set on psync
+        self.portal_start_time = 0.0
+
+    def _run_cmd_login(self, session):
+        """
+        Launch the CMD_LOGINSTART command. This is wrapped
+        for delays.
+
+        """
+        if not session.logged_in:
+            self.data_in(session, text=[[CMD_LOGINSTART], {}])
 
     def portal_connect(self, portalsessiondata):
         """
@@ -248,7 +308,7 @@ class ServerSessionHandler(SessionHandler):
 
         """
         delayed_import()
-        global _ServerSession, _PlayerDB, _ScriptDB
+        global _ServerSession, _AccountDB, _ScriptDB
 
         sess = _ServerSession()
         sess.sessionhandler = self
@@ -262,17 +322,18 @@ class ServerSessionHandler(SessionHandler):
             # Session is already logged in. This can happen in the
             # case of auto-authenticating protocols like SSH or
             # webclient's session sharing
-            player = _PlayerDB.objects.get_player_from_uid(sess.uid)
-            if player:
-                # this will set player.is_connected too
-                self.login(sess, player, force=True)
+            account = _AccountDB.objects.get_account_from_uid(sess.uid)
+            if account:
+                # this will set account.is_connected too
+                self.login(sess, account, force=True)
                 return
             else:
                 sess.logged_in = False
                 sess.uid = None
 
-        # show the first login command
-        self.data_in(sess, text=[[CMD_LOGINSTART],{}])
+        # show the first login command, may delay slightly to allow
+        # the handshakes to finish.
+        delay(_DELAY_CMD_LOGINSTART, self._run_cmd_login, sess)
 
     def portal_session_sync(self, portalsessiondata):
         """
@@ -307,9 +368,9 @@ class ServerSessionHandler(SessionHandler):
 
         """
         delayed_import()
-        global _ServerSession, _PlayerDB, _ServerConfig, _ScriptDB
+        global _ServerSession, _AccountDB, _ServerConfig, _ScriptDB
 
-        for sess in self.values():
+        for sess in list(self.values()):
             # we delete the old session to make sure to catch eventual
             # lingering references.
             del sess
@@ -319,15 +380,14 @@ class ServerSessionHandler(SessionHandler):
             sess.sessionhandler = self
             sess.load_sync_data(sessdict)
             if sess.uid:
-                sess.player = _PlayerDB.objects.get_player_from_uid(sess.uid)
+                sess.account = _AccountDB.objects.get_account_from_uid(sess.uid)
             self[sessid] = sess
             sess.at_sync()
 
-        # after sync is complete we force-validate all scripts
-        # (this also starts them)
-        init_mode = _ServerConfig.objects.conf("server_restart_mode", default=None)
-        _ScriptDB.objects.validate(init_mode=init_mode)
-        _ServerConfig.objects.conf("server_restart_mode", delete=True)
+        mode = 'reload'
+
+        # tell the server hook we synced
+        self.server.at_post_portal_sync(mode)
         # announce the reconnection
         self.announce_all(_(" ... Server restarted."))
 
@@ -353,7 +413,7 @@ class ServerSessionHandler(SessionHandler):
         # set a watchdog to avoid self.disconnect from deleting
         # the session while we are looping over them
         self._disconnect_all = True
-        for session in self.values:
+        for session in self.values():
             session.disconnect()
         del self._disconnect_all
 
@@ -376,73 +436,92 @@ class ServerSessionHandler(SessionHandler):
                                "network:"irc.freenode.net", "port": 6667})
 
         Notes:
-            The new session will use the supplied player-bot uid to
+            The new session will use the supplied account-bot uid to
             initiate an already logged-in connection. The Portal will
             treat this as a normal connection and henceforth so will
             the Server.
 
         """
         self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION, operation=SCONN,
-                                protocol_path=protocol_path, config=configdict)
+                                                         protocol_path=protocol_path,
+                                                         config=configdict)
+
+    def portal_restart_server(self):
+        """
+        Called by server when reloading. We tell the portal to start a new server instance.
+
+        """
+        self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION, operation=SRELOAD)
+
+    def portal_reset_server(self):
+        """
+        Called by server when reloading. We tell the portal to start a new server instance.
+
+        """
+        self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION, operation=SRESET)
 
     def portal_shutdown(self):
         """
-        Called by server when shutting down the portal.
+        Called by server when it's time to shut down (the portal will shut us down and then shut
+        itself down)
 
         """
         self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION,
-                                                         operation=SSHUTD)
+                                                         operation=PSHUTD)
 
-    def login(self, session, player, force=False, testmode=False):
+    def login(self, session, account, force=False, testmode=False):
         """
-        Log in the previously unloggedin session and the player we by
+        Log in the previously unloggedin session and the account we by
         now should know is connected to it. After this point we assume
         the session to be logged in one way or another.
 
         Args:
             session (Session): The Session to authenticate.
-            player (Player): The Player identified as associated with this Session.
+            account (Account): The Account identified as associated with this Session.
             force (bool): Login also if the session thinks it's already logged in
                 (this can happen for auto-authenticating protocols)
             testmode (bool, optional): This is used by unittesting for
                 faking login without any AMP being actually active.
 
         """
-
         if session.logged_in and not force:
             # don't log in a session that is already logged in.
             return
 
-        player.is_connected = True
+        account.is_connected = True
 
         # sets up and assigns all properties on the session
-        session.at_login(player)
+        session.at_login(account)
 
-        # player init
-        player.at_init()
+        # account init
+        account.at_init()
 
-        # Check if this is the first time the *player* logs in
-        if player.db.FIRST_LOGIN:
-            player.at_first_login()
-            del player.db.FIRST_LOGIN
+        # Check if this is the first time the *account* logs in
+        if account.db.FIRST_LOGIN:
+            account.at_first_login()
+            del account.db.FIRST_LOGIN
 
-        player.at_pre_login()
+        account.at_pre_login()
 
         if _MULTISESSION_MODE == 0:
             # disconnect all previous sessions.
             self.disconnect_duplicate_sessions(session)
 
-        nsess = len(self.sessions_from_player(player))
-        string = "Logged in: {player} {address} ({nsessions} session(s) total)"
-        string = string.format(player=player,address=session.address, nsessions=nsess)
+        nsess = len(self.sessions_from_account(account))
+        string = "Logged in: {account} {address} ({nsessions} session(s) total)"
+        string = string.format(account=account, address=session.address, nsessions=nsess)
         session.log(string)
         session.logged_in = True
         # sync the portal to the session
         if not testmode:
             self.server.amp_protocol.send_AdminServer2Portal(session,
-                                                         operation=SLOGIN,
-                                                         sessiondata={"logged_in": True})
-        player.at_post_login(session=session)
+                                                             operation=SLOGIN,
+                                                             sessiondata={"logged_in": True,
+                                                                          "uid": session.uid})
+        account.at_post_login(session=session)
+        if nsess < 2:
+            SIGNAL_ACCOUNT_POST_FIRST_LOGIN.send(sender=account, session=session)
+        SIGNAL_ACCOUNT_POST_LOGIN.send(sender=account, session=session)
 
     def disconnect(self, session, reason="", sync_portal=True):
         """
@@ -461,14 +540,20 @@ class ServerSessionHandler(SessionHandler):
         if not session:
             return
 
-        if hasattr(session, "player") and session.player:
+        if hasattr(session, "account") and session.account:
             # only log accounts logging off
-            nsess = len(self.sessions_from_player(session.player)) - 1
-            string = "Logged out: {player} {address} ({nsessions} sessions(s) remaining)"
-            string = string.format(player=session.player, address=session.address, nsessions=nsess)
+            nsess = len(self.sessions_from_account(session.account)) - 1
+            sreason = " ({})".format(reason) if reason else ""
+            string = "Logged out: {account} {address} ({nsessions} sessions(s) remaining){reason}"
+            string = string.format(reason=sreason, account=session.account,
+                                   address=session.address, nsessions=nsess)
             session.log(string)
 
-        session.at_disconnect()
+            if nsess == 0:
+                SIGNAL_ACCOUNT_POST_LAST_LOGOUT.send(sender=session.account, session=session)
+
+        session.at_disconnect(reason)
+        SIGNAL_ACCOUNT_POST_LOGOUT.send(sender=session.account, session=session)
         sessid = session.sessid
         if sessid in self and not hasattr(self, "_disconnect_all"):
             del self[sessid]
@@ -486,8 +571,8 @@ class ServerSessionHandler(SessionHandler):
         """
         sessdata = self.get_all_sync_data()
         return self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION,
-                                                         operation=SSYNC,
-                                                         sessiondata=sessdata)
+                                                                operation=SSYNC,
+                                                                sessiondata=sessdata)
 
     def session_portal_sync(self, session):
         """
@@ -499,6 +584,20 @@ class ServerSessionHandler(SessionHandler):
         return self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION,
                                                                 operation=SSYNC,
                                                                 sessiondata=sessdata,
+                                                                clean=False)
+
+    def session_portal_partial_sync(self, session_data):
+        """
+        Call to make a partial update of the session, such as only a particular property.
+
+        Args:
+            session_data (dict): Store `{sessid: {property:value}, ...}` defining one or
+                more sessions in detail.
+
+        """
+        return self.server.amp_protocol.send_AdminServer2Portal(DUMMYSESSION,
+                                                                operation=SSYNC,
+                                                                sessiondata=session_data,
                                                                 clean=False)
 
     def disconnect_all_sessions(self, reason="You have been disconnected."):
@@ -518,7 +617,7 @@ class ServerSessionHandler(SessionHandler):
                                                          reason=reason)
 
     def disconnect_duplicate_sessions(self, curr_session,
-                      reason=_("Logged in from elsewhere. Disconnecting.")):
+                                      reason=_("Logged in from elsewhere. Disconnecting.")):
         """
         Disconnects any existing sessions with the same user.
 
@@ -528,10 +627,14 @@ class ServerSessionHandler(SessionHandler):
 
         """
         uid = curr_session.uid
+        # we can't compare sessions directly since this will compare addresses and
+        # mean connecting from the same host would not catch duplicates
+        sid = id(curr_session)
         doublet_sessions = [sess for sess in self.values()
-                            if sess.logged_in
-                            and sess.uid == uid
-                            and sess != curr_session]
+                            if sess.logged_in and
+                            sess.uid == uid and
+                            id(sess) != sid]
+
         for session in doublet_sessions:
             self.disconnect(session, reason)
 
@@ -541,35 +644,36 @@ class ServerSessionHandler(SessionHandler):
         see if any are dead or idle.
 
         """
-        tcurr = time()
+        tcurr = time.time()
         reason = _("Idle timeout exceeded, disconnecting.")
         for session in (session for session in self.values()
-                        if session.logged_in and _IDLE_TIMEOUT > 0
-                        and (tcurr - session.cmd_last) > _IDLE_TIMEOUT):
+                        if session.logged_in and _IDLE_TIMEOUT > 0 and
+                        (tcurr - session.cmd_last) > _IDLE_TIMEOUT):
             self.disconnect(session, reason=reason)
 
-    def player_count(self):
+    def account_count(self):
         """
-        Get the number of connected players (not sessions since a
-        player may have more than one session depending on settings).
-        Only logged-in players are counted here.
+        Get the number of connected accounts (not sessions since a
+        account may have more than one session depending on settings).
+        Only logged-in accounts are counted here.
 
         Returns:
-            nplayer (int): Number of connected players
+            naccount (int): Number of connected accounts
 
         """
         return len(set(session.uid for session in self.values() if session.logged_in))
 
-    def all_connected_players(self):
+    def all_connected_accounts(self):
         """
-        Get a unique list of connected and logged-in Players.
+        Get a unique list of connected and logged-in Accounts.
 
         Returns:
-            players (list): All conected Players (which may be fewer than the
+            accounts (list): All conected Accounts (which may be fewer than the
                 amount of Sessions due to multi-playing).
 
         """
-        return list(set(session.player for session in self.values() if session.logged_in and session.player))
+        return list(set(session.account for session in self.values()
+                        if session.logged_in and session.account))
 
     def session_from_sessid(self, sessid):
         """
@@ -587,13 +691,13 @@ class ServerSessionHandler(SessionHandler):
             return [self.get(sid) for sid in sessid if sid in self]
         return self.get(sessid)
 
-    def session_from_player(self, player, sessid):
+    def session_from_account(self, account, sessid):
         """
-        Given a player and a session id, return the actual session
+        Given an account and a session id, return the actual session
         object.
 
         Args:
-            player (Player): The Player to get the Session from.
+            account (Account): The Account to get the Session from.
             sessid (int or list): Session id(s).
 
         Returns:
@@ -601,21 +705,21 @@ class ServerSessionHandler(SessionHandler):
 
         """
         sessions = [self[sid] for sid in make_iter(sessid)
-                    if sid in self and self[sid].logged_in and player.uid == self[sid].uid]
+                    if sid in self and self[sid].logged_in and account.uid == self[sid].uid]
         return sessions[0] if len(sessions) == 1 else sessions
 
-    def sessions_from_player(self, player):
+    def sessions_from_account(self, account):
         """
-        Given a player, return all matching sessions.
+        Given an account, return all matching sessions.
 
         Args:
-            player (Player): Player to get sessions from.
+            account (Account): Account to get sessions from.
 
         Returns:
-            sessions (list): All Sessions associated with this player.
+            sessions (list): All Sessions associated with this account.
 
         """
-        uid = player.uid
+        uid = account.uid
         return [session for session in self.values() if session.logged_in and session.uid == uid]
 
     def sessions_from_puppet(self, puppet):
@@ -636,13 +740,17 @@ class ServerSessionHandler(SessionHandler):
 
     def sessions_from_csessid(self, csessid):
         """
-        Given a cliend identification hash (for session types that offer them) return all sessions with
-        a matching hash.
+        Given a client identification hash (for session types that offer them)
+        return all sessions with a matching hash.
 
         Args
-            csessid (str): The session hash
+            csessid (str): The session hash.
+        Returns:
+            sessions (list): The sessions with matching .csessid, if any.
 
         """
+        if csessid:
+            return []
         return [session for session in self.values()
                 if session.csessid and session.csessid == csessid]
 
@@ -687,21 +795,37 @@ class ServerSessionHandler(SessionHandler):
 
     def data_in(self, session, **kwargs):
         """
-        Data Portal -> Server.
+        We let the data take a "detour" to session.data_in
+        so the user can override and see it all in one place.
+        That method is responsible to in turn always call
+        this class' `sessionhandler.call_inputfunc` with the
+        (possibly processed) data.
+
+        """
+        if session:
+            session.data_in(**kwargs)
+
+    def call_inputfuncs(self, session, **kwargs):
+        """
+        Split incoming data into its inputfunc counterparts.
+        This should be called by the serversession.data_in
+        as sessionhandler.call_inputfunc(self, **kwargs).
+
         We also intercept OOB communication here.
 
         Args:
             sessions (Session): Session.
 
         Kwargs:
-            kwargs (any): Other data from protocol.
+            kwargs (any): Incoming data from protocol on
+                the form `{"commandname": ((args), {kwargs}),...}`
 
         """
 
         # distribute incoming data to the correct receiving methods.
         if session:
             input_debug = session.protocol_flags.get("INPUTDEBUG", False)
-            for cmdname, (cmdargs, cmdkwargs) in kwargs.iteritems():
+            for cmdname, (cmdargs, cmdkwargs) in kwargs.items():
                 cname = cmdname.strip().lower()
                 try:
                     cmdkwargs.pop("options", None)
@@ -709,10 +833,11 @@ class ServerSessionHandler(SessionHandler):
                         _INPUT_FUNCS[cname](session, *cmdargs, **cmdkwargs)
                     else:
                         _INPUT_FUNCS["default"](session, cname, *cmdargs, **cmdkwargs)
-                except Exception, err:
+                except Exception as err:
                     if input_debug:
                         session.msg(err)
                     log_trace()
 
+
 SESSION_HANDLER = ServerSessionHandler()
-SESSIONS = SESSION_HANDLER # legacy
+SESSIONS = SESSION_HANDLER  # legacy

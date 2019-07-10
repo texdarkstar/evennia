@@ -4,7 +4,6 @@ The custom manager for Scripts.
 
 from django.db.models import Q
 from evennia.typeclasses.managers import TypedObjectManager, TypeclassManager
-from evennia.typeclasses.managers import returns_typeclass_list
 from evennia.utils.utils import make_iter
 __all__ = ("ScriptManager",)
 _GA = object.__getattribute__
@@ -35,7 +34,7 @@ class ScriptDBManager(TypedObjectManager):
     copy_script
 
     """
-    @returns_typeclass_list
+
     def get_all_scripts_on_obj(self, obj, key=None):
         """
         Find all Scripts related to a particular object.
@@ -51,24 +50,23 @@ class ScriptDBManager(TypedObjectManager):
         """
         if not obj:
             return []
-        player = _GA(_GA(obj, "__dbclass__"), "__name__") == "PlayerDB"
+        account = _GA(_GA(obj, "__dbclass__"), "__name__") == "AccountDB"
         if key:
             dbref = self.dbref(key)
             if dbref or dbref == 0:
-                if player:
-                    return self.filter(db_player=obj, id=dbref)
+                if account:
+                    return self.filter(db_account=obj, id=dbref)
                 else:
                     return self.filter(db_obj=obj, id=dbref)
-            elif player:
-                return self.filter(db_player=obj, db_key=key)
+            elif account:
+                return self.filter(db_account=obj, db_key=key)
             else:
                 return self.filter(db_obj=obj, db_key=key)
-        elif player:
-            return self.filter(db_player=obj)
+        elif account:
+            return self.filter(db_account=obj)
         else:
             return self.filter(db_obj=obj)
 
-    @returns_typeclass_list
     def get_all_scripts(self, key=None):
         """
         Get all scripts in the database.
@@ -85,7 +83,8 @@ class ScriptDBManager(TypedObjectManager):
             script = []
             dbref = self.dbref(key)
             if dbref or dbref == 0:
-                script = [self.dbref_search(dbref)]
+                # return either [] or a valid list (never [None])
+                script = [res for res in [self.dbref_search(dbref)] if res]
             if not script:
                 script = self.filter(db_key=key)
             return script
@@ -132,7 +131,7 @@ class ScriptDBManager(TypedObjectManager):
         return nr_deleted
 
     def validate(self, scripts=None, obj=None, key=None, dbref=None,
-                 init_mode=False):
+                 init_mode=None):
         """
         This will step through the script database and make sure
         all objects run scripts that are still valid in the context
@@ -152,7 +151,7 @@ class ScriptDBManager(TypedObjectManager):
                 particular id.
             init_mode (str, optional): This is used during server
                 upstart and can have three values:
-                - `False` (no init mode). Called during run.
+                - `None` (no init mode). Called during run.
                 - `"reset"` - server reboot. Kill non-persistent scripts
                 - `"reload"` - server reload. Keep non-persistent scripts.
         Returns:
@@ -199,7 +198,7 @@ class ScriptDBManager(TypedObjectManager):
             elif obj:
                 scripts = self.get_all_scripts_on_obj(obj, key=key)
             else:
-                scripts = self.get_all_scripts(key=key) #self.model.get_all_cached_instances()
+                scripts = self.get_all_scripts(key=key)
 
         if not scripts:
             # no scripts available to validate
@@ -215,8 +214,7 @@ class ScriptDBManager(TypedObjectManager):
         VALIDATE_ITERATION -= 1
         return nr_started, nr_stopped
 
-    @returns_typeclass_list
-    def script_search(self, ostring, obj=None, only_timed=False):
+    def search_script(self, ostring, obj=None, only_timed=False, typeclass=None):
         """
         Search for a particular script.
 
@@ -226,6 +224,7 @@ class ScriptDBManager(TypedObjectManager):
                 this object
             only_timed (bool): Limit search only to scripts that run
                 on a timer.
+            typeclass (class or str): Typeclass or path to typeclass.
 
         """
 
@@ -235,15 +234,24 @@ class ScriptDBManager(TypedObjectManager):
         if dbref or dbref == 0:
             # this is a dbref, try to find the script directly
             dbref_match = self.dbref_search(dbref)
-            if dbref_match and not ((obj and obj != dbref_match.obj)
-                                     or (only_timed and dbref_match.interval)):
+            if dbref_match and not ((obj and obj != dbref_match.obj) or
+                                    (only_timed and dbref_match.interval)):
                 return [dbref_match]
+
+        if typeclass:
+            if callable(typeclass):
+                typeclass = "%s.%s" % (typeclass.__module__, typeclass.__name__)
+            else:
+                typeclass = "%s" % typeclass
 
         # not a dbref; normal search
         obj_restriction = obj and Q(db_obj=obj) or Q()
-        timed_restriction = only_timed and Q(interval__gt=0) or Q()
-        scripts = self.filter(timed_restriction & obj_restriction & Q(db_key__iexact=ostring))
+        timed_restriction = only_timed and Q(db_interval__gt=0) or Q()
+        typeclass_restriction = typeclass and Q(db_typeclass_path=typeclass) or Q()
+        scripts = self.filter(timed_restriction & obj_restriction & typeclass_restriction & Q(db_key__iexact=ostring))
         return scripts
+    # back-compatibility alias
+    script_search = search_script
 
     def copy_script(self, original_script, new_key=None, new_obj=None, new_locks=None):
         """
@@ -269,6 +277,7 @@ class ScriptDBManager(TypedObjectManager):
         new_script = create.create_script(typeclass, key=new_key, obj=new_obj,
                                           locks=new_locks, autostart=True)
         return new_script
+
 
 class ScriptManager(ScriptDBManager, TypeclassManager):
     pass

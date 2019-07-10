@@ -4,7 +4,7 @@ A Command Set (CmdSet) holds a set of commands. The Cmdsets can be
 merged and combined to create new sets of commands in a
 non-destructive way. This makes them very powerful for implementing
 custom game states where different commands (or different variations
-of commands) are available to the players depending on circumstance.
+of commands) are available to the accounts depending on circumstance.
 
 The available merge operations are partly borrowed from mathematical
 Set theory.
@@ -40,21 +40,21 @@ class _CmdSetMeta(type):
     the cmdset class.
 
     """
-    def __init__(mcs, *args, **kwargs):
+    def __init__(cls, *args, **kwargs):
         """
         Fixes some things in the cmdclass
 
         """
         # by default we key the cmdset the same as the
         # name of its class.
-        if not hasattr(mcs, 'key') or not mcs.key:
-            mcs.key = mcs.__name__
-        mcs.path = "%s.%s" % (mcs.__module__, mcs.__name__)
+        if not hasattr(cls, 'key') or not cls.key:
+            cls.key = cls.__name__
+        cls.path = "%s.%s" % (cls.__module__, cls.__name__)
 
-        if not type(mcs.key_mergetypes) == dict:
-            mcs.key_mergetypes = {}
+        if not isinstance(cls.key_mergetypes, dict):
+            cls.key_mergetypes = {}
 
-        super(_CmdSetMeta, mcs).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
 
 class CmdSet(with_metaclass(_CmdSetMeta, object)):
@@ -110,9 +110,9 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
                  merger (i.e. A above) automatically taking
                  precedence. But if allow_duplicates is true, the
                  result will be a merger with more than one of each
-                 name match.  This will usually lead to the player
+                 name match.  This will usually lead to the account
                  receiving a multiple-match error higher up the road,
-                 but can be good for things like cmdsets on non-player
+                 but can be good for things like cmdsets on non-account
                  objects in a room, to allow the system to warn that
                  more than one 'ball' in the room has the same 'kick'
                  command defined on it, so it may offer a chance to
@@ -134,7 +134,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
                         commands
     no_channels   - ignore the name of channels when matching against
                         commands (WARNING- this is dangerous since the
-                        player can then not even ask staff for help if
+                        account can then not even ask staff for help if
                         something goes wrong)
 
 
@@ -167,9 +167,9 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
         Creates a new CmdSet instance.
 
         Args:
-            cmdsetobj (Session, Player, Object, optional): This is the database object
+            cmdsetobj (Session, Account, Object, optional): This is the database object
                 to which this particular instance of cmdset is related. It
-                is often a character but may also be a regular object, Player
+                is often a character but may also be a regular object, Account
                 or Session.
             key (str, optional): The idenfier for this cmdset. This
                 helps if wanting to selectively remov cmdsets.
@@ -188,7 +188,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
 
         # initialize system
         self.at_cmdset_creation()
-        self._contains_cache = WeakKeyDictionary()#{}
+        self._contains_cache = WeakKeyDictionary()  # {}
 
     # Priority-sensitive merge operations for cmdsets
 
@@ -214,7 +214,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
             cmdset_c.commands.extend(cmdset_b.commands)
         else:
             cmdset_c.commands.extend([cmd for cmd in cmdset_b
-                                      if not cmd in cmdset_a])
+                                      if cmd not in cmdset_a])
         return cmdset_c
 
     def _intersect(self, cmdset_a, cmdset_b):
@@ -280,7 +280,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
         """
 
         cmdset_c = cmdset_a._duplicate()
-        cmdset_c.commands = [cmd for cmd in cmdset_b if not cmd in cmdset_a]
+        cmdset_c.commands = [cmd for cmd in cmdset_b if cmd not in cmdset_a]
         return cmdset_c
 
     def _instantiate(self, cmd):
@@ -296,9 +296,9 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
             result (any): An instantiated Command or the input unmodified.
 
         """
-        try:
+        if callable(cmd):
             return cmd()
-        except TypeError:
+        else:
             return cmd
 
     def _duplicate(self):
@@ -351,52 +351,51 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
             self._contains_cache[othercmd] = ret
         return ret
 
-    def __add__(self, cmdset_b):
+    def __add__(self, cmdset_a):
         """
-        Merge this cmdset (A) with another cmdset (B) using the + operator,
+        Merge this cmdset (B) with another cmdset (A) using the + operator,
 
-        C = A + B
+        C = B + A
 
         Here, we (by convention) say that 'A is merged onto B to form
         C'.  The actual merge operation used in the 'addition' depends
         on which priorities A and B have. The one of the two with the
         highest priority will apply and give its properties to C. In
-        the case of a tie, A takes priority and replaces the
+        the case of a tie, A  takes priority and replaces the
         same-named commands in B unless A has the 'duplicate' variable
         set (which means both sets' commands are kept).
         """
 
         # It's okay to merge with None
-        if not cmdset_b:
+        if not cmdset_a:
             return self
 
-        sys_commands_a = self.get_system_cmds()
-        sys_commands_b = cmdset_b.get_system_cmds()
+        sys_commands_a = cmdset_a.get_system_cmds()
+        sys_commands_b = self.get_system_cmds()
 
-        if self.priority >= cmdset_b.priority:
-            # A higher or equal priority than B
+        if self.priority <= cmdset_a.priority:
+            # A higher or equal priority to B
 
             # preserve system __commands
             sys_commands = sys_commands_a + [cmd for cmd in sys_commands_b
                                              if cmd not in sys_commands_a]
 
-            mergetype = self.key_mergetypes.get(cmdset_b.key, self.mergetype)
+            mergetype = cmdset_a.key_mergetypes.get(self.key, cmdset_a.mergetype)
             if mergetype == "Intersect":
-                cmdset_c = self._intersect(self, cmdset_b)
+                cmdset_c = self._intersect(cmdset_a, self)
             elif mergetype == "Replace":
-                cmdset_c = self._replace(self, cmdset_b)
+                cmdset_c = self._replace(cmdset_a, self)
             elif mergetype == "Remove":
-                cmdset_c = self._remove(self, cmdset_b)
-            else: # Union
-                cmdset_c = self._union(self, cmdset_b)
-            # update or pass-through
-            cmdset_c.no_channels = cmdset_b.no_channels if self.no_channels is None else self.no_channels
-            cmdset_c.no_exits = cmdset_b.no_exits if self.no_exits is None else self.no_exits
-            cmdset_c.no_objs = cmdset_b.no_objs if self.no_objs is None else self.no_objs
-            cmdset_c.duplicates = cmdset_b.duplicates if self.duplicates is None else self.duplicates
-            if self.key.startswith("_"):
-                # don't rename new output if the merge set's name starts with _
-                cmdset_c.key = cmdset_b.key
+                cmdset_c = self._remove(cmdset_a, self)
+            else:  # Union
+                cmdset_c = self._union(cmdset_a, self)
+
+            # pass through options whenever they are set, unless the merging or higher-prio
+            # set changes the setting (i.e. has a non-None value). We don't pass through
+            # the duplicates setting; that is per-merge
+            cmdset_c.no_channels = self.no_channels if cmdset_a.no_channels is None else cmdset_a.no_channels
+            cmdset_c.no_exits = self.no_exits if cmdset_a.no_exits is None else cmdset_a.no_exits
+            cmdset_c.no_objs = self.no_objs if cmdset_a.no_objs is None else cmdset_a.no_objs
 
         else:
             # B higher priority than A
@@ -405,31 +404,29 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
             sys_commands = sys_commands_b + [cmd for cmd in sys_commands_a
                                              if cmd not in sys_commands_b]
 
-            mergetype = cmdset_b.key_mergetypes.get(self.key, cmdset_b.mergetype)
+            mergetype = self.key_mergetypes.get(cmdset_a.key, self.mergetype)
             if mergetype == "Intersect":
-                cmdset_c = self._intersect(cmdset_b, self)
+                cmdset_c = self._intersect(self, cmdset_a)
             elif mergetype == "Replace":
-                cmdset_c = self._replace(cmdset_b, self)
+                cmdset_c = self._replace(self, cmdset_a)
             elif mergetype == "Remove":
-                cmdset_c = self._remove(cmdset_b, self)
+                cmdset_c = self._remove(self, cmdset_a)
             else:  # Union
-                cmdset_c = self._union(cmdset_b, self)
-            cmdset_c.no_channels = cmdset_b.no_channels
-            cmdset_c.no_exits = cmdset_b.no_exits
-            cmdset_c.no_objs = cmdset_b.no_objs
-            # update or pass-through
-            cmdset_c.no_channels = self.no_channels if self.no_channels is None else cmdset_b.no_channels
-            cmdset_c.no_exits = self.no_exits if self.no_exits is None else cmdset_b.no_exits
-            cmdset_c.no_objs = self.no_objs if self.no_objs is None else cmdset_b.no_objs
-            cmdset_c.duplicates = self.duplicates if self.duplicates is None else cmdset_b.duplicates
-            if cmdset_b.key.startswith("_"):
-                # don't rename new output if the merge set's name starts with _
-                cmdset_c.key = self.key
+                cmdset_c = self._union(self, cmdset_a)
+
+            # pass through options whenever they are set, unless the higher-prio
+            # set changes the setting (i.e. has a non-None value). We don't pass through
+            # the duplicates setting; that is per-merge
+            cmdset_c.no_channels = cmdset_a.no_channels if self.no_channels is None else self.no_channels
+            cmdset_c.no_exits = cmdset_a.no_exits if self.no_exits is None else self.no_exits
+            cmdset_c.no_objs = cmdset_a.no_objs if self.no_objs is None else self.no_objs
 
         # we store actual_mergetype since key_mergetypes
         # might be different from the main mergetype.
         # This is used for diagnosis.
         cmdset_c.actual_mergetype = mergetype
+
+        # print "__add__ for %s (prio %i)  called with %s (prio %i)." % (self.key, self.priority, cmdset_a.key, cmdset_a.priority)
 
         # return the system commands to the cmdset
         cmdset_c.add(sys_commands)
@@ -514,6 +511,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
                 ic = self.system_commands.index(cmd)
                 del self.system_commands[ic]
             except ValueError:
+                # ignore error
                 pass
         else:
             self.commands = [oldcmd for oldcmd in self.commands if oldcmd != cmd]
@@ -534,6 +532,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
         for thiscmd in self.commands:
             if thiscmd == cmd:
                 return thiscmd
+        return None
 
     def count(self):
         """
@@ -605,7 +604,7 @@ class CmdSet(with_metaclass(_CmdSetMeta, object)):
         names = []
         if caller:
             [names.extend(cmd._keyaliases) for cmd in self.commands
-                           if cmd.access(caller)]
+             if cmd.access(caller)]
         else:
             [names.extend(cmd._keyaliases) for cmd in self.commands]
         return names

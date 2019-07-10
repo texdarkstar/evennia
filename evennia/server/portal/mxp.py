@@ -18,13 +18,16 @@ import re
 
 LINKS_SUB = re.compile(r'\|lc(.*?)\|lt(.*?)\|le', re.DOTALL)
 
-MXP = "\x5B"
+# MXP Telnet option
+MXP = b'\x5b'
+
 MXP_TEMPSECURE = "\x1B[4z"
 MXP_SEND = MXP_TEMPSECURE + \
-           "<SEND HREF='\\1'>" + \
-           "\\2" + \
-           MXP_TEMPSECURE + \
-           "</SEND>"
+    "<SEND HREF=\"\\1\">" + \
+    "\\2" + \
+    MXP_TEMPSECURE + \
+    "</SEND>"
+
 
 def mxp_parse(text):
     """
@@ -43,6 +46,7 @@ def mxp_parse(text):
 
     text = LINKS_SUB.sub(MXP_SEND, text)
     return text
+
 
 class Mxp(object):
     """
@@ -82,5 +86,5 @@ class Mxp(object):
 
         """
         self.protocol.protocol_flags["MXP"] = True
-        self.protocol.requestNegotiation(MXP, '')
+        self.protocol.requestNegotiation(MXP, b'')
         self.protocol.handshake_done()

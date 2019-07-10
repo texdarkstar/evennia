@@ -6,20 +6,31 @@
     - guilib_import  - for using your own gui lib
 -->
 
-
 {% block client %}
 
-<div id="wrapper">
+<!-- Basic toolbar -->
+<div id="toolbar"></div>
+
+<!-- "Main" Content -->
+<div id="main"  class="split split-vertical" data-role-default>
+  <div id="main-sub" class="split-sub">
     <div id="messagewindow"></div>
-    <div id="inputform">
-        <div id="prompt"></div>
-        <div id="inputcontrol">
-            <textarea id="inputfield" type="text"></textarea>
-            <input id="inputsend" type="button" value="&gt;"/>
-        </div>
+  </div>
+</div>
+<!-- "Input" Pane -->
+<div id="input" class="split split-vertical" data-role-input data-update-append>
+  <div id="inputform" class="wrapper">
+    <div id="prompt" class="prompt">
     </div>
-    <div id="inputsizer"></div>
+    <div id="inputcontrol" class="input-group">
+      <textarea id="inputfield" type="text" class="form-control"></textarea>
+      <span class="input-group-btn">
+        <button class="btn btn-large btn-outline-primary" id="inputsend" type="button" value="">&gt;</button>
+      </span>
+    </div>
+  </div>
 </div>
 
 {% endblock %}
-
+{% block scripts %}
+{% endblock %}

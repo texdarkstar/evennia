@@ -3,7 +3,8 @@ Functions for processing input commands.
 
 All global functions in this module whose name does not start with "_"
 is considered an inputfunc. Each function must have the following
-callsign:
+callsign (where inputfunc name is always lower-case, no matter what the
+OOB input name looked like):
 
     inputfunc(session, *args, **kwargs)
 
@@ -21,11 +22,12 @@ settings.INPUT_FUNC_MODULES.
 from future.utils import viewkeys
 
 import importlib
+from codecs import lookup as codecs_lookup
 from django.conf import settings
 from evennia.commands.cmdhandler import cmdhandler
-from evennia.players.models import PlayerDB
+from evennia.accounts.models import AccountDB
 from evennia.utils.logger import log_err
-from evennia.utils.utils import to_str, to_unicode
+from evennia.utils.utils import to_str
 
 BrowserSessionStore = importlib.import_module(settings.SESSION_ENGINE).SessionStore
 
@@ -35,7 +37,11 @@ _IDLE_COMMAND = settings.IDLE_COMMAND
 _IDLE_COMMAND = (_IDLE_COMMAND, ) if _IDLE_COMMAND == "idle" else (_IDLE_COMMAND, "idle")
 _GA = object.__getattribute__
 _SA = object.__setattr__
-_NA = lambda o: "N/A"
+
+
+def _NA(o):
+    return "N/A"
+
 
 _ERROR_INPUT = "Inputfunc {name}({session}): Wrong/unrecognized input: {inp}"
 
@@ -48,6 +54,7 @@ def text(session, *args, **kwargs):
     string on the server.
 
     Args:
+        session (Session): The active Session to receive the input.
         text (str): First arg is used as text-command input. Other
             arguments are ignored.
 
@@ -55,28 +62,56 @@ def text(session, *args, **kwargs):
     #from evennia.server.profiling.timetrace import timetrace
     #text = timetrace(text, "ServerSession.data_in")
 
-    text = args[0] if args else None
+    txt = args[0] if args else None
 
-    #explicitly check for None since text can be an empty string, which is
-    #also valid
-    if text is None:
+    # explicitly check for None since text can be an empty string, which is
+    # also valid
+    if txt is None:
         return
     # this is treated as a command input
     # handle the 'idle' command
-    if text.strip() in _IDLE_COMMAND:
+    if txt.strip() in _IDLE_COMMAND:
         session.update_session_counters(idle=True)
         return
-    if session.player:
+    if session.account:
         # nick replacement
         puppet = session.puppet
         if puppet:
-            text = puppet.nicks.nickreplace(text,
-                          categories=("inputline", "channel"), include_player=True)
+            txt = puppet.nicks.nickreplace(txt,
+                                           categories=("inputline", "channel"), include_account=True)
         else:
-            text = session.player.nicks.nickreplace(text,
-                        categories=("inputline", "channel"), include_player=False)
+            txt = session.account.nicks.nickreplace(txt,
+                                                    categories=("inputline", "channel"), include_account=False)
     kwargs.pop("options", None)
-    cmdhandler(session, text, callertype="session", session=session, **kwargs)
+    cmdhandler(session, txt, callertype="session", session=session, **kwargs)
+    session.update_session_counters()
+
+
+def bot_data_in(session, *args, **kwargs):
+    """
+    Text input from the IRC and RSS bots.
+    This will trigger the execute_cmd method on the bots in-game counterpart.
+
+    Args:
+        session (Session): The active Session to receive the input.
+        text (str): First arg is text input. Other arguments are ignored.
+
+    """
+
+    txt = args[0] if args else None
+
+    # Explicitly check for None since text can be an empty string, which is
+    # also valid
+    if txt is None:
+        return
+    # this is treated as a command input
+    # handle the 'idle' command
+    if txt.strip() in _IDLE_COMMAND:
+        session.update_session_counters(idle=True)
+        return
+    kwargs.pop("options", None)
+    # Trigger the execute_cmd method of the corresponding bot.
+    session.account.execute_cmd(session=session, txt=txt, **kwargs)
     session.update_session_counters()
 
 
@@ -94,43 +129,19 @@ def default(session, cmdname, *args, **kwargs):
 
     """
     err = "Session {sessid}: Input command not recognized:\n" \
-            " name: '{cmdname}'\n" \
-            " args, kwargs: {args}, {kwargs}".format(sessid=session.sessid,
-                                                     cmdname=cmdname,
-                                                     args=args,
-                                                     kwargs=kwargs)
+        " name: '{cmdname}'\n" \
+        " args, kwargs: {args}, {kwargs}".format(sessid=session.sessid,
+                                                 cmdname=cmdname,
+                                                 args=args,
+                                                 kwargs=kwargs)
     if session.protocol_flags.get("INPUTDEBUG", False):
         session.msg(err)
     log_err(err)
 
 
-def browser_sessid(session, *args, **kwargs):
-    """
-    This is a utility function for the webclient (only) to communicate its
-    current browser session hash. This is important in order to link
-    the browser session to the evennia session. Only the very first
-    storage request will be accepted, the following ones will be ignored.
-
-    Args:
-        browserid (str): Browser session hash
-
-    """
-    if not session.browserid:
-        print "stored browserid:", session, args[0]
-        session.browserid = args[0]
-        if not session.logged_in:
-            # automatic log in if the django browser session already authenticated.
-            browsersession = BrowserSessionStore(session_key=args[0])
-            uid = browsersession.get("logged_in", None)
-            if uid:
-                try:
-                    player =  PlayerDB.objects.get(pk=uid)
-                except Exception:
-                    return
-                session.sessionhandler.login(session, player)
-
-
-
+_CLIENT_OPTIONS = \
+    ("ANSI", "XTERM256", "MXP", "UTF-8", "SCREENREADER", "ENCODING", "MCCP",
+     "SCREENHEIGHT", "SCREENWIDTH", "INPUTDEBUG", "RAW", "NOCOLOR", "NOGOAHEAD")
 
 
 def client_options(session, *args, **kwargs):
@@ -152,26 +163,22 @@ def client_options(session, *args, **kwargs):
         screenheight (int): Screen height in lines
         screenwidth (int): Screen width in characters
         inputdebug (bool): Debug input functions
-        nomarkup (bool): Strip markup
+        nocolor (bool): Strip color
         raw (bool): Turn off parsing
 
     """
-    flags = session.protocol_flags
+    old_flags = session.protocol_flags
     if not kwargs or kwargs.get("get", False):
         # return current settings
-        options = dict((key, flags[key]) for key in flags
-                if key.upper() in ("ANSI", "XTERM256", "MXP",
-                           "UTF-8", "SCREENREADER", "ENCODING",
-                           "MCCP", "SCREENHEIGHT",
-                           "SCREENWIDTH", "INPUTDEBUG",
-                           "RAW", "NOMARKUP"))
+        options = dict((key, old_flags[key]) for key in old_flags
+                       if key.upper() in _CLIENT_OPTIONS)
         session.msg(client_options=options)
         return
 
     def validate_encoding(val):
         # helper: change encoding
         try:
-            to_str(to_unicode("test-string"), encoding=val)
+            codecs_lookup(val)
         except LookupError:
             raise RuntimeError("The encoding '|w%s|n' is invalid. " % val)
         return val
@@ -180,11 +187,12 @@ def client_options(session, *args, **kwargs):
         return {0: int(val)}
 
     def validate_bool(val):
-        if isinstance(val, basestring):
+        if isinstance(val, str):
             return True if val.lower() in ("true", "on", "1") else False
         return bool(val)
 
-    for key, value in kwargs.iteritems():
+    flags = {}
+    for key, value in kwargs.items():
         key = key.lower()
         if key == "client":
             flags["CLIENTNAME"] = to_str(value)
@@ -211,25 +219,25 @@ def client_options(session, *args, **kwargs):
             flags["SCREENWIDTH"] = validate_size(value)
         elif key == "inputdebug":
             flags["INPUTDEBUG"] = validate_bool(value)
-        elif key == "nomarkup":
-            flags["NOMARKUP"] = validate_bool(value)
+        elif key == "nocolor":
+            flags["NOCOLOR"] = validate_bool(value)
         elif key == "raw":
             flags["RAW"] = validate_bool(value)
+        elif key == "nogoahead":
+            flags["NOGOAHEAD"] = validate_bool(value)
         elif key in ('Char 1', 'Char.Skills 1', 'Char.Items 1',
-                'Room 1', 'IRE.Rift 1', 'IRE.Composer 1'):
+                     'Room 1', 'IRE.Rift 1', 'IRE.Composer 1'):
             # ignore mudlet's default send (aimed at IRE games)
             pass
-        elif not key in ("options", "cmdid"):
+        elif key not in ("options", "cmdid"):
             err = _ERROR_INPUT.format(
-                    name="client_settings", session=session, inp=key)
+                name="client_settings", session=session, inp=key)
             session.msg(text=err)
-    session.protocol_flags = flags
-    # we must update the portal as well
-    session.sessionhandler.session_portal_sync(session)
 
-# GMCP alias
-hello = client_options
-supports_set = client_options
+    session.protocol_flags.update(flags)
+    # we must update the protocol flags on the portal session copy as well
+    session.sessionhandler.session_portal_partial_sync(
+            {session.sessid: {"protocol_flags": flags}})
 
 
 def get_client_options(session, *args, **kwargs):
@@ -246,7 +254,7 @@ def get_inputfuncs(session, *args, **kwargs):
     So we get it from the sessionhandler.
     """
     inputfuncsdict = dict((key, func.__doc__) for key, func
-                          in session.sessionhandler.get_inputfuncs().iteritems())
+                          in session.sessionhandler.get_inputfuncs().items())
     session.msg(get_inputfuncs=inputfuncsdict)
 
 
@@ -256,15 +264,16 @@ def login(session, *args, **kwargs):
     in. This will also automatically throttle too quick attempts.
 
     Kwargs:
-        name (str): Player name
+        name (str): Account name
         password (str): Plain-text password
 
     """
     if not session.logged_in and "name" in kwargs and "password" in kwargs:
-        from evennia.commands.default.unloggedin import create_normal_player
-        player = create_normal_player(session, kwargs["name"], kwargs["password"])
-        if player:
-            session.sessionhandler.login(session, player)
+        from evennia.commands.default.unloggedin import create_normal_account
+        account = create_normal_account(session, kwargs["name"], kwargs["password"])
+        if account:
+            session.sessionhandler.login(session, account)
+
 
 _gettable = {
     "name": lambda obj: obj.key,
@@ -273,10 +282,11 @@ _gettable = {
     "servername": lambda obj: settings.SERVERNAME
 }
 
+
 def get_value(session, *args, **kwargs):
     """
     Return the value of a given attribute or db_property on the
-    session's current player or character.
+    session's current account or character.
 
     Kwargs:
       name (str): Name of info value to return. Only names
@@ -285,9 +295,9 @@ def get_value(session, *args, **kwargs):
 
     """
     name = kwargs.get("name", "")
-    obj = session.puppet or session.player
+    obj = session.puppet or session.account
     if name in _gettable:
-        session.msg(get_value=_gettable[name](obj))
+        session.msg(get_value={"name": name, "value": _gettable[name](obj)})
 
 
 def _testrepeat(**kwargs):
@@ -303,7 +313,7 @@ def _testrepeat(**kwargs):
 
 
 _repeatable = {"test1": _testrepeat,  # example only
-               "test2": _testrepeat}  #      "
+               "test2": _testrepeat}  # "
 
 
 def repeat(session, *args, **kwargs):
@@ -336,7 +346,6 @@ def repeat(session, *args, **kwargs):
         session.msg("Allowed repeating functions are: %s" % (", ".join(_repeatable)))
 
 
-
 def unrepeat(session, *args, **kwargs):
     "Wrapper for OOB use"
     kwargs["stop"] = True
@@ -355,7 +364,14 @@ def _on_monitor_change(**kwargs):
     obj = kwargs["obj"]
     name = kwargs["name"]
     session = kwargs["session"]
-    session.msg(monitor={"name": name, "value": _GA(obj, fieldname)})
+    outputfunc_name = kwargs['outputfunc_name']
+
+    # the session may be None if the char quits and someone
+    # else then edits the object
+
+    if session:
+        callsign = {outputfunc_name: {"name": name, "value": _GA(obj, fieldname)}}
+        session.msg(**callsign)
 
 
 def monitor(session, *args, **kwargs):
@@ -368,10 +384,14 @@ def monitor(session, *args, **kwargs):
         in the _monitorable dict earlier in this module
         are accepted.
       stop (bool): Stop monitoring the above name.
+      outputfunc_name (str, optional): Change the name of
+        the outputfunc name. This is used e.g. by MSDP which
+        has its own specific output format.
 
     """
     from evennia.scripts.monitorhandler import MONITOR_HANDLER
     name = kwargs.get("name", None)
+    outputfunc_name = kwargs("outputfunc_name", "monitor")
     if name and name in _monitorable and session.puppet:
         field_name = _monitorable[name]
         obj = session.puppet
@@ -380,7 +400,8 @@ def monitor(session, *args, **kwargs):
         else:
             # the handler will add fieldname and obj to the kwargs automatically
             MONITOR_HANDLER.add(obj, field_name, _on_monitor_change, idstring=session.sessid,
-                            persistent=False, name=name, session=session)
+                                persistent=False, name=name, session=session,
+                                outputfunc_name=outputfunc_name)
 
 
 def unmonitor(session, *args, **kwargs):
@@ -389,3 +410,135 @@ def unmonitor(session, *args, **kwargs):
     """
     kwargs["stop"] = True
     monitor(session, *args, **kwargs)
+
+
+def monitored(session, *args, **kwargs):
+    """
+    Report on what is being monitored
+
+    """
+    from evennia.scripts.monitorhandler import MONITOR_HANDLER
+    obj = session.puppet
+    monitors = MONITOR_HANDLER.all(obj=obj)
+    session.msg(monitored=(monitors, {}))
+
+
+def _on_webclient_options_change(**kwargs):
+    """
+    Called when the webclient options stored on the account changes.
+    Inform the interested clients of this change.
+    """
+    session = kwargs["session"]
+    obj = kwargs["obj"]
+    fieldname = kwargs["fieldname"]
+    clientoptions = _GA(obj, fieldname)
+
+    # the session may be None if the char quits and someone
+    # else then edits the object
+    if session:
+        session.msg(webclient_options=clientoptions)
+
+
+def webclient_options(session, *args, **kwargs):
+    """
+    Handles retrieving and changing of options related to the webclient.
+
+    If kwargs is empty (or contains just a "cmdid"), the saved options will be
+    sent back to the session.
+    A monitor handler will be created to inform the client of any future options
+    that changes.
+
+    If kwargs is not empty, the key/values stored in there will be persisted
+    to the account object.
+
+    Kwargs:
+        <option name>: an option to save
+    """
+    account = session.account
+
+    clientoptions = account.db._saved_webclient_options
+    if not clientoptions:
+        # No saved options for this account, copy and save the default.
+        account.db._saved_webclient_options = settings.WEBCLIENT_OPTIONS.copy()
+        # Get the _SaverDict created by the database.
+        clientoptions = account.db._saved_webclient_options
+
+    # The webclient adds a cmdid to every kwargs, but we don't need it.
+    try:
+        del kwargs["cmdid"]
+    except KeyError:
+        pass
+
+    if not kwargs:
+        # No kwargs: we are getting the stored options
+        # Convert clientoptions to regular dict for sending.
+        session.msg(webclient_options=dict(clientoptions))
+
+        # Create a monitor. If a monitor already exists then it will replace
+        # the previous one since it would use the same idstring
+        from evennia.scripts.monitorhandler import MONITOR_HANDLER
+        MONITOR_HANDLER.add(account, "_saved_webclient_options",
+                            _on_webclient_options_change,
+                            idstring=session.sessid, persistent=False,
+                            session=session)
+    else:
+        # kwargs provided: persist them to the account object
+        for key, value in kwargs.items():
+            clientoptions[key] = value
+
+
+# OOB protocol-specific aliases and wrappers
+
+# GMCP aliases
+hello = client_options
+supports_set = client_options
+
+
+# MSDP aliases (some of the the generic MSDP commands defined in the MSDP spec are prefixed
+# by msdp_ at the protocol level)
+# See https://tintin.sourceforge.io/protocols/msdp/
+
+
+def msdp_list(session, *args, **kwargs):
+    """
+    MSDP LIST command
+
+    """
+    from evennia.scripts.monitorhandler import MONITOR_HANDLER
+    args_lower = [arg.lower() for arg in args]
+    if "commands" in args_lower:
+        inputfuncs = [key[5:] if key.startswith("msdp_") else key
+                      for key in session.sessionhandler.get_inputfuncs().keys()]
+        session.msg(commands=(inputfuncs, {}))
+    if "lists" in args_lower:
+        session.msg(lists=(['commands', 'lists', 'configurable_variables', 'reportable_variables',
+                            'reported_variables', 'sendable_variables'], {}))
+    if "configurable_variables" in args_lower:
+        session.msg(configurable_variables=(_CLIENT_OPTIONS, {}))
+    if "reportable_variables" in args_lower:
+        session.msg(reportable_variables=(_monitorable, {}))
+    if "reported_variables" in args_lower:
+        obj = session.puppet
+        monitor_infos = MONITOR_HANDLER.all(obj=obj)
+        fieldnames = [tup[1] for tup in monitor_infos]
+        session.msg(reported_variables=(fieldnames, {}))
+    if "sendable_variables" in args_lower:
+        # no default sendable variables
+        session.msg(sendable_variables=([], {}))
+
+
+def msdp_report(session, *args, **kwargs):
+    """
+    MSDP REPORT command
+
+    """
+    kwargs['outputfunc_name': 'report']
+    monitor(session, *args, **kwargs)
+
+
+def msdp_unreport(session, *args, **kwargs):
+    """
+    MSDP UNREPORT command
+
+    """
+    unmonitor(session, *args, **kwargs)

@@ -8,20 +8,32 @@ sessions etc.
 """
 
 import re
+from twisted.internet import protocol
 from twisted.internet.task import LoopingCall
-from twisted.conch.telnet import Telnet, StatefulTelnetProtocol, IAC, NOP, LINEMODE, GA, WILL, WONT, ECHO, NULL
+from twisted.conch.telnet import Telnet, StatefulTelnetProtocol
+from twisted.conch.telnet import IAC, NOP, LINEMODE, GA, WILL, WONT, ECHO, NULL
 from django.conf import settings
 from evennia.server.session import Session
-from evennia.server.portal import ttype, mssp, telnet_oob, naws
+from evennia.server.portal import ttype, mssp, telnet_oob, naws, suppress_ga
 from evennia.server.portal.mccp import Mccp, mccp_compress, MCCP
 from evennia.server.portal.mxp import Mxp, mxp_parse
-from evennia.utils import ansi, logger
-from evennia.utils.utils import to_str
+from evennia.utils import ansi
+from evennia.utils.utils import to_bytes
 
-_RE_N = re.compile(r"\{n$")
-_RE_LEND = re.compile(r"\n$|\r$|\r\n$|\r\x00$|", re.MULTILINE)
+_RE_N = re.compile(r"\|n$")
+_RE_LEND = re.compile(br"\n$|\r$|\r\n$|\r\x00$|", re.MULTILINE)
+_RE_LINEBREAK = re.compile(br"\n\r|\r\n|\n|\r", re.DOTALL + re.MULTILINE)
 _RE_SCREENREADER_REGEX = re.compile(r"%s" % settings.SCREENREADER_REGEX_STRIP, re.DOTALL + re.MULTILINE)
-_IDLE_COMMAND = settings.IDLE_COMMAND + "\n"
+_IDLE_COMMAND = str.encode(settings.IDLE_COMMAND + "\n")
+
+
+class TelnetServerFactory(protocol.ServerFactory):
+    "This is only to name this better in logs"
+    noisy = False
+
+    def logPrefix(self):
+        return "Telnet"
+
 
 class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
     """
@@ -29,9 +41,10 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
     clients) gets a telnet protocol instance assigned to them.  All
     communication between game and player goes through here.
     """
+
     def __init__(self, *args, **kwargs):
-        self.protocol_name = "telnet"
-        super(TelnetProtocol, self).__init__(*args, **kwargs)
+        self.protocol_key = "telnet"
+        super().__init__(*args, **kwargs)
 
     def connectionMade(self):
         """
@@ -39,16 +52,22 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
 
         """
         # initialize the session
-        self.line_buffer = []
-        self.iaw_mode = False
-        self.no_lb_mode = False
+        self.line_buffer = b""
         client_address = self.transport.client
         client_address = client_address[0] if client_address else None
         # this number is counted down for every handshake that completes.
         # when it reaches 0 the portal/server syncs their data
-        self.handshakes = 7 # naws, ttype, mccp, mssp, msdp, gmcp, mxp
-        self.init_session(self.protocol_name, client_address, self.factory.sessionhandler)
+        self.handshakes = 8  # suppress-go-ahead, naws, ttype, mccp, mssp, msdp, gmcp, mxp
 
+        self.init_session(self.protocol_key, client_address, self.factory.sessionhandler)
+        self.protocol_flags["ENCODING"] = settings.ENCODINGS[0] if settings.ENCODINGS else 'utf-8'
+        # add this new connection to sessionhandler so
+        # the Server becomes aware of it.
+        self.sessionhandler.connect(self)
+        # change encoding to ENCODINGS[0] which reflects Telnet default encoding
+
+        # suppress go-ahead
+        self.sga = suppress_ga.SuppressGA(self)
         # negotiate client size
         self.naws = naws.Naws(self)
         # negotiate ttype (client info)
@@ -62,13 +81,10 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
         self.oob = telnet_oob.TelnetOOB(self)
         # mxp support
         self.mxp = Mxp(self)
-        # add this new connection to sessionhandler so
-        # the Server becomes aware of it.
-        self.sessionhandler.connect(self)
 
-        # timeout the handshakes in case the client doesn't reply at all
         from evennia.utils.utils import delay
-        delay(2, callback=self.handshake_done, force=True)
+        # timeout the handshakes in case the client doesn't reply at all
+        self._handshake_delay = delay(2, callback=self.handshake_done, timeout=True)
 
         # TCP/IP keepalive watches for dead links
         self.transport.setTcpKeepAlive(1)
@@ -79,7 +95,7 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
         self.toggle_nop_keepalive()
 
     def _send_nop_keepalive(self):
-        "Send NOP keepalive unless flag is set"
+        """Send NOP keepalive unless flag is set"""
         if self.protocol_flags.get("NOPKEEPALIVE"):
             self._write(IAC + NOP)
 
@@ -96,21 +112,28 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
             self.nop_keep_alive = LoopingCall(self._send_nop_keepalive)
             self.nop_keep_alive.start(30, now=False)
 
-    def handshake_done(self, force=False):
+    def handshake_done(self, timeout=False):
         """
         This is called by all telnet extensions once they are finished.
         When all have reported, a sync with the server is performed.
         The system will force-call this sync after a small time to handle
         clients that don't reply to handshakes at all.
         """
-        if self.handshakes > 0:
-            if force:
+        if timeout:
+            if self.handshakes > 0:
+                self.handshakes = 0
                 self.sessionhandler.sync(self)
-                return
+        else:
             self.handshakes -= 1
             if self.handshakes <= 0:
                 # do the sync
                 self.sessionhandler.sync(self)
+
+    def at_login(self):
+        """
+        Called when this session gets authenticated by the server.
+        """
+        pass
 
     def enableRemote(self, option):
         """
@@ -127,7 +150,8 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
                 option == ttype.TTYPE or
                 option == naws.NAWS or
                 option == MCCP or
-                option == mssp.MSSP)
+                option == mssp.MSSP or
+                option == suppress_ga.SUPPRESS_GA)
 
     def enableLocal(self, option):
         """
@@ -140,7 +164,9 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
             enable (bool): If this option should be enabled.
 
         """
-        return (option == MCCP or option==ECHO)
+        return (option == MCCP or
+                option == ECHO or
+                option == suppress_ga.SUPPRESS_GA)
 
     def disableLocal(self, option):
         """
@@ -156,7 +182,7 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
             self.mccp.no_mccp(option)
             return True
         else:
-            return super(TelnetProtocol, self).disableLocal(option)
+            return super().disableLocal(option)
 
     def connectionLost(self, reason):
         """
@@ -171,72 +197,43 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
         self.sessionhandler.disconnect(self)
         self.transport.loseConnection()
 
-    def dataReceived(self, data):
+    def applicationDataReceived(self, data):
         """
-        Handle incoming data over the wire.
-
-        This method will split the incoming data depending on if it
-        starts with IAC (a telnet command) or not. All other data will
-        be handled in line mode. Some clients also sends an erroneous
-        line break after IAC, which we must watch out for.
+        Telnet method called when non-telnet-command data is coming in
+        over the telnet connection. We pass it on to the game engine
+        directly.
 
         Args:
             data (str): Incoming data.
 
-        Notes:
-            OOB protocols (MSDP etc) already intercept subnegotiations on
-            their own, never entering this method. They will relay their
-            parsed data directly to self.data_in.
-
         """
-        if data and data[0] == IAC or self.iaw_mode:
-            try:
-                super(TelnetProtocol, self).dataReceived(data)
-                if len(data) == 1:
-                    self.iaw_mode = True
-                else:
-                    self.iaw_mode = False
-                return
-            except Exception as err1:
-                conv = ""
-                try:
-                    for b in data:
-                        conv += " " + repr(ord(b))
-                except Exception as err2:
-                    conv = str(err2) + ":", str(data)
-                out = "Telnet Error (%s): %s (%s)" % (err1, data, conv)
-                logger.log_trace(out)
-                return
-
-        if data and data.strip() == NULL:
-            # This is an ancient type of keepalive still used by some
-            # legacy clients. There should never be a reason to send
-            # a lone NULL character so this seems ok to support for
-            # backwards compatibility.
-            data = _IDLE_COMMAND
-
-        if self.no_lb_mode and _RE_LEND.search(data):
-            # we are in no_lb_mode and receive a line break;
-            # this means we should empty the buffer and send
-            # the command.
-            data = "".join(self.line_buffer) + data
-            data = data.rstrip("\r\n") + "\n"
-            self.line_buffer = []
-            self.no_lb_mode = False
-        elif not _RE_LEND.search(data):
-            # no line break at the end of the command, buffer instead.
-            self.line_buffer.append(data)
-            self.no_lb_mode = True
-            return
-
-        # if we get to this point the command should end with a linebreak.
-        StatefulTelnetProtocol.dataReceived(self, data)
+        if not data:
+            data = [data]
+        elif data.strip() == NULL:
+            # this is an ancient type of keepalive used by some
+            # legacy clients. There should never be a reason to send a
+            # lone NULL character so this seems to be a safe thing to
+            # support for backwards compatibility. It also stops the
+            # NULL from continuously popping up as an unknown command.
+            data = [_IDLE_COMMAND]
+        else:
+            data = _RE_LINEBREAK.split(data)
+            if self.line_buffer and len(data) > 1:
+                # buffer exists, it is terminated by the first line feed
+                data[0] = self.line_buffer + data[0]
+                self.line_buffer = b""
+            # if the last data split is empty, it means all splits have
+            # line breaks, if not, it is unterminated and must be
+            # buffered.
+            self.line_buffer += data.pop()
+        # send all data chunks
+        for dat in data:
+            self.data_in(text=dat + b"\n")
 
     def _write(self, data):
-        "hook overloading the one used in plain telnet"
-        data = data.replace('\n', '\r\n').replace('\r\r\n', '\r\n')
-        #data = data.replace('\n', '\r\n')
-        super(TelnetProtocol, self)._write(mccp_compress(self, data))
+        """hook overloading the one used in plain telnet"""
+        data = data.replace(b'\n', b'\r\n').replace(b'\r\r\n', b'\r\n')
+        super()._write(mccp_compress(self, data))
 
     def sendLine(self, line):
         """
@@ -246,34 +243,28 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
             line (str): Line to send.
 
         """
-        #escape IAC in line mode, and correctly add \r\n
-        line += self.delimiter
-        line = line.replace(IAC, IAC + IAC).replace('\n', '\r\n')
+        line = to_bytes(line, self)
+        # escape IAC in line mode, and correctly add \r\n (the TELNET end-of-line)
+        line = line.replace(IAC, IAC + IAC)
+        line = line.replace(b'\n', b'\r\n')
+        if not line.endswith(b"\r\n") and self.protocol_flags.get("FORCEDENDLINE", True):
+            line += b"\r\n"
+        if not self.protocol_flags.get("NOGOAHEAD", True):
+            line += IAC + GA
         return self.transport.write(mccp_compress(self, line))
-
-    def lineReceived(self, string):
-        """
-        Telnet method called when data is coming in over the telnet
-        connection. We pass it on to the game engine directly.
-
-        Args:
-            string (str): Incoming data.
-
-        """
-        self.data_in(text=string)
 
     # Session hooks
 
-    def disconnect(self, reason=None):
+    def disconnect(self, reason=""):
         """
         generic hook for the engine to call in order to
         disconnect this protocol.
 
         Args:
-            reason (str): Reason for disconnecting.
+            reason (str, optional): Reason for disconnecting.
 
         """
-        self.data_out(text=((reason or "",), {}))
+        self.data_out(text=((reason,), {}))
         self.connectionLost(reason)
 
     def data_in(self, **kwargs):
@@ -284,8 +275,8 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
             kwargs (any): Options from the protocol.
 
         """
-        #from evennia.server.profiling.timetrace import timetrace
-        #text = timetrace(text, "telnet.data_in")
+        # from evennia.server.profiling.timetrace import timetrace  # DEBUG
+        # text = timetrace(text, "telnet.data_in")  # DEBUG
 
         self.sessionhandler.data_in(self, **kwargs)
 
@@ -313,7 +304,7 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
                    - ansi: Enforce no ANSI colors.
                    - xterm256: Enforce xterm256 colors, regardless of TTYPE.
                    - noxterm256: Enforce no xterm256 color support, regardless of TTYPE.
-                   - nomarkup: Strip all ANSI markup. This is the same as noxterm256,noansi
+                   - nocolor: Strip all Color, regardless of ansi/xterm256 setting.
                    - raw: Pass string through without any ansi processing
                         (i.e. include Evennia ansi markers but do not
                         convert them into ansi tokens)
@@ -325,18 +316,17 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
         text = args[0] if args else ""
         if text is None:
             return
-        text = to_str(text, force_string=True)
 
         # handle arguments
         options = kwargs.get("options", {})
         flags = self.protocol_flags
-        xterm256 = options.get("xterm256", flags.get('XTERM256', False) if flags["TTYPE"] else True)
-        useansi = options.get("ansi", flags.get('ANSI', False) if flags["TTYPE"] else True)
+        xterm256 = options.get("xterm256", flags.get('XTERM256', False) if flags.get("TTYPE", False) else True)
+        useansi = options.get("ansi", flags.get('ANSI', False) if flags.get("TTYPE", False) else True)
         raw = options.get("raw", flags.get("RAW", False))
-        nomarkup = options.get("nomarkup", flags.get("NOMARKUP", not (xterm256 or useansi)))
+        nocolor = options.get("nocolor", flags.get("NOCOLOR") or not (xterm256 or useansi))
         echo = options.get("echo", None)
         mxp = options.get("mxp", flags.get("MXP", False))
-        screenreader =  options.get("screenreader", flags.get("SCREENREADER", False))
+        screenreader = options.get("screenreader", flags.get("SCREENREADER", False))
 
         if screenreader:
             # screenreader mode cleans up output
@@ -345,12 +335,15 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
 
         if options.get("send_prompt"):
             # send a prompt instead.
+            prompt = text
             if not raw:
                 # processing
-                prompt = ansi.parse_ansi(_RE_N.sub("", text) + "{n", strip_ansi=nomarkup, xterm256=xterm256)
+                prompt = ansi.parse_ansi(_RE_N.sub("", prompt) + ("||n" if prompt.endswith("|") else "|n"),
+                                         strip_ansi=nocolor, xterm256=xterm256)
                 if mxp:
                     prompt = mxp_parse(prompt)
-            prompt = prompt.replace(IAC, IAC + IAC).replace('\n', '\r\n')
+            prompt = to_bytes(prompt, self)
+            prompt = prompt.replace(IAC, IAC + IAC).replace(b'\n', b'\r\n')
             prompt += IAC + GA
             self.transport.write(mccp_compress(self, prompt))
         else:
@@ -362,11 +355,11 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
                     # by telling the client that WE WON'T echo, the client knows
                     # that IT should echo. This is the expected behavior from
                     # our perspective.
-                    self.transport.write(mccp_compress(self, IAC+WONT+ECHO))
+                    self.transport.write(mccp_compress(self, IAC + WONT + ECHO))
                 else:
                     # by telling the client that WE WILL echo, the client can
                     # safely turn OFF its OWN echo.
-                    self.transport.write(mccp_compress(self, IAC+WILL+ECHO))
+                    self.transport.write(mccp_compress(self, IAC + WILL + ECHO))
             if raw:
                 # no processing
                 self.sendLine(text)
@@ -374,7 +367,8 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
             else:
                 # we need to make sure to kill the color at the end in order
                 # to match the webclient output.
-                linetosend = ansi.parse_ansi(_RE_N.sub("", text) + "{n", strip_ansi=nomarkup, xterm256=xterm256, mxp=mxp)
+                linetosend = ansi.parse_ansi(_RE_N.sub("", text) + ("||n" if text.endswith("|") else "|n"),
+                                             strip_ansi=nocolor, xterm256=xterm256, mxp=mxp)
                 if mxp:
                     linetosend = mxp_parse(linetosend)
                 self.sendLine(linetosend)
@@ -386,7 +380,6 @@ class TelnetProtocol(Telnet, StatefulTelnetProtocol, Session):
         """
         kwargs["options"].update({"send_prompt": True})
         self.send_text(*args, **kwargs)
-
 
     def send_default(self, cmdname, *args, **kwargs):
         """

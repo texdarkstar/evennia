@@ -8,7 +8,7 @@ snippet #577349 on http://code.activestate.com.
 
 (extensively modified by Griatch 2010)
 """
-from __future__ import absolute_import
+
 from builtins import object
 
 import re
@@ -30,48 +30,48 @@ class TextToHTMLparser(object):
     tabstop = 4
     # mapping html color name <-> ansi code.
     hilite = ANSI_HILITE
-    unhilite = ANSI_UNHILITE # this will be stripped - there is no css equivalent.
-    normal = ANSI_NORMAL     #                    "
+    unhilite = ANSI_UNHILITE  # this will be stripped - there is no css equivalent.
+    normal = ANSI_NORMAL  # "
     underline = ANSI_UNDERLINE
     blink = ANSI_BLINK
     inverse = ANSI_INVERSE   # this will produce an outline; no obvious css equivalent?
     colorcodes = [
-            ('color-000', unhilite + ANSI_BLACK), # pure black
-            ('color-001', unhilite + ANSI_RED),
-            ('color-002', unhilite + ANSI_GREEN),
-            ('color-003', unhilite + ANSI_YELLOW),
-            ('color-004', unhilite + ANSI_BLUE),
-            ('color-005', unhilite + ANSI_MAGENTA),
-            ('color-006', unhilite + ANSI_CYAN),
-            ('color-007', unhilite + ANSI_WHITE), # light grey
-            ('color-008', hilite + ANSI_BLACK), # dark grey
-            ('color-009', hilite + ANSI_RED),
-            ('color-010', hilite + ANSI_GREEN),
-            ('color-011', hilite + ANSI_YELLOW),
-            ('color-012', hilite + ANSI_BLUE),
-            ('color-013', hilite + ANSI_MAGENTA),
-            ('color-014', hilite + ANSI_CYAN),
-            ('color-015', hilite + ANSI_WHITE)  # pure white
-        ] + [("color-%03i" % (i+16), XTERM256_FG % ("%i" % (i+16))) for i in xrange(240)]
+        ('color-000', unhilite + ANSI_BLACK),  # pure black
+        ('color-001', unhilite + ANSI_RED),
+        ('color-002', unhilite + ANSI_GREEN),
+        ('color-003', unhilite + ANSI_YELLOW),
+        ('color-004', unhilite + ANSI_BLUE),
+        ('color-005', unhilite + ANSI_MAGENTA),
+        ('color-006', unhilite + ANSI_CYAN),
+        ('color-007', unhilite + ANSI_WHITE),  # light grey
+        ('color-008', hilite + ANSI_BLACK),  # dark grey
+        ('color-009', hilite + ANSI_RED),
+        ('color-010', hilite + ANSI_GREEN),
+        ('color-011', hilite + ANSI_YELLOW),
+        ('color-012', hilite + ANSI_BLUE),
+        ('color-013', hilite + ANSI_MAGENTA),
+        ('color-014', hilite + ANSI_CYAN),
+        ('color-015', hilite + ANSI_WHITE)  # pure white
+    ] + [("color-%03i" % (i + 16), XTERM256_FG % ("%i" % (i + 16))) for i in range(240)]
 
     colorback = [
-            ('bgcolor-000', ANSI_BACK_BLACK), # pure black
-            ('bgcolor-001', ANSI_BACK_RED),
-            ('bgcolor-002', ANSI_BACK_GREEN),
-            ('bgcolor-003', ANSI_BACK_YELLOW),
-            ('bgcolor-004', ANSI_BACK_BLUE),
-            ('bgcolor-005', ANSI_BACK_MAGENTA),
-            ('bgcolor-006', ANSI_BACK_CYAN),
-            ('bgcolor-007', ANSI_BACK_WHITE), # light grey
-            ('bgcolor-008', hilite + ANSI_BACK_BLACK), # dark grey
-            ('bgcolor-009', hilite + ANSI_BACK_RED),
-            ('bgcolor-010', hilite + ANSI_BACK_GREEN),
-            ('bgcolor-011', hilite + ANSI_BACK_YELLOW),
-            ('bgcolor-012', hilite + ANSI_BACK_BLUE),
-            ('bgcolor-013', hilite + ANSI_BACK_MAGENTA),
-            ('bgcolor-014', hilite + ANSI_BACK_CYAN),
-            ('bgcolor-015', hilite + ANSI_BACK_WHITE),  # pure white
-    ] + [("bgcolor-%03i" % (i+16), XTERM256_BG % ("%i" % (i+16))) for i in range(240)]
+        ('bgcolor-000', ANSI_BACK_BLACK),  # pure black
+        ('bgcolor-001', ANSI_BACK_RED),
+        ('bgcolor-002', ANSI_BACK_GREEN),
+        ('bgcolor-003', ANSI_BACK_YELLOW),
+        ('bgcolor-004', ANSI_BACK_BLUE),
+        ('bgcolor-005', ANSI_BACK_MAGENTA),
+        ('bgcolor-006', ANSI_BACK_CYAN),
+        ('bgcolor-007', ANSI_BACK_WHITE),  # light grey
+        ('bgcolor-008', hilite + ANSI_BACK_BLACK),  # dark grey
+        ('bgcolor-009', hilite + ANSI_BACK_RED),
+        ('bgcolor-010', hilite + ANSI_BACK_GREEN),
+        ('bgcolor-011', hilite + ANSI_BACK_YELLOW),
+        ('bgcolor-012', hilite + ANSI_BACK_BLUE),
+        ('bgcolor-013', hilite + ANSI_BACK_MAGENTA),
+        ('bgcolor-014', hilite + ANSI_BACK_CYAN),
+        ('bgcolor-015', hilite + ANSI_BACK_WHITE),  # pure white
+    ] + [("bgcolor-%03i" % (i + 16), XTERM256_BG % ("%i" % (i + 16))) for i in range(240)]
 
     # make sure to escape [
     #colorcodes = [(c, code.replace("[", r"\[")) for c, code in colorcodes]
@@ -80,8 +80,8 @@ class TextToHTMLparser(object):
     bg_colormap = dict((code, clr) for clr, code in colorback)
 
     # create stop markers
-    fgstop =  "(?:\033\[1m|\033\[22m)*\033\[3[0-8].*?m|\033\[0m|$"
-    bgstop =  "(?:\033\[1m|\033\[22m)*\033\[4[0-8].*?m|\033\[0m|$"
+    fgstop = "(?:\033\[1m|\033\[22m)*\033\[3[0-8].*?m|\033\[0m|$"
+    bgstop = "(?:\033\[1m|\033\[22m)*\033\[4[0-8].*?m|\033\[0m|$"
 
     # extract color markers, tagging the start marker and the text marked
     re_fgs = re.compile("((?:\033\[1m|\033\[22m)*\033\[3[0-8].*?m)(.*?)(?=" + fgstop + ")")
@@ -93,9 +93,9 @@ class TextToHTMLparser(object):
     re_uline = re.compile("(?:%s)(.*?)(?=%s|%s)" % (underline.replace("[", r"\["), fgstop, bgstop))
     re_blink = re.compile("(?:%s)(.*?)(?=%s|%s)" % (blink.replace("[", r"\["), fgstop, bgstop))
     re_inverse = re.compile("(?:%s)(.*?)(?=%s|%s)" % (inverse.replace("[", r"\["), fgstop, bgstop))
-    re_string = re.compile(r'(?P<htmlchars>[<&>])|(?P<space> [ \t]+)|(?P<lineend>\r\n|\r|\n)', re.S|re.M|re.I)
+    re_string = re.compile(r'(?P<htmlchars>[<&>])|(?P<space> [ \t]+)|(?P<spacestart>^ )|(?P<lineend>\r\n|\r|\n)', re.S | re.M | re.I)
     re_url = re.compile(r'((?:ftp|www|https?)\W+(?:(?!\.(?:\s|$)|&\w+;)[^"\',;$*^\\(){}<>\[\]\s])+)(\.(?:\s|$)|&\w+;|)')
-    re_mxplink =  re.compile(r'\|lc(.*?)\|lt(.*?)\|le', re.DOTALL)
+    re_mxplink = re.compile(r'\|lc(.*?)\|lt(.*?)\|le', re.DOTALL)
 
     def _sub_fg(self, colormatch):
         code, text = colormatch.groups()
@@ -135,7 +135,7 @@ class TextToHTMLparser(object):
 
         """
         text = self.re_hilite.sub(r'<strong>\1</strong>', text)
-        return self.re_unhilite.sub(r'\1', text) # strip unhilite - there is no equivalent in css.
+        return self.re_unhilite.sub(r'\1', text)  # strip unhilite - there is no equivalent in css.
 
     def re_underline(self, text):
         """
@@ -215,6 +215,7 @@ class TextToHTMLparser(object):
             text (str): Processed text.
 
         """
+        return text
         return text.replace(r'\n', r'<br>')
 
     def convert_urls(self, text):
@@ -232,9 +233,10 @@ class TextToHTMLparser(object):
         # change pages (and losing our webclient session).
         return self.re_url.sub(r'<a href="\1" target="_blank">\1</a>\2', text)
 
-    def convert_links(self, text):
+    def sub_mxp_links(self, match):
         """
-        Replaces links with HTML code.
+        Helper method to be passed to re.sub,
+        replaces MXP links with HTML code.
 
         Args:
             text (str): Text to process.
@@ -243,9 +245,13 @@ class TextToHTMLparser(object):
             text (str): Processed text.
 
         """
-        return self.re_mxplink.sub(r"""<a id='mxplink' href='#' onclick='Evennia.msg("text",["\1"],{}); return false;'>\2</a>""", text)
+        cmd, text = [grp.replace('\"', "\\&quot;") for grp in match.groups()]
+        val = r'''<a id="mxplink" href="#" ''' \
+            '''onclick="Evennia.msg(&quot;text&quot;,[&quot;{cmd}&quot;],{{}});''' \
+            '''return false;">{text}</a>'''.format(cmd=cmd, text=text)
+        return val
 
-    def do_sub(self, match):
+    def sub_text(self, match):
         """
         Helper method to be passed to re.sub,
         for handling all substitutions.
@@ -264,10 +270,11 @@ class TextToHTMLparser(object):
             return '<br>'
         elif cdict['space'] == '\t':
             return ' ' * self.tabstop
-        elif cdict['space']:
+        elif cdict['space'] or cdict["spacestart"]:
             text = match.group().replace('\t', '&nbsp;' * self.tabstop)
             text = text.replace(' ', '&nbsp;')
             return text
+        return None
 
     def parse(self, text, strip_ansi=False):
         """
@@ -284,7 +291,8 @@ class TextToHTMLparser(object):
         # parse everything to ansi first
         text = parse_ansi(text, strip_ansi=strip_ansi, xterm256=True, mxp=True)
         # convert all ansi to html
-        result = re.sub(self.re_string, self.do_sub, text)
+        result = re.sub(self.re_string, self.sub_text, text)
+        result = re.sub(self.re_mxplink, self.sub_mxp_links, result)
         result = self.re_color(result)
         result = self.re_bold(result)
         result = self.re_underline(result)
@@ -294,11 +302,11 @@ class TextToHTMLparser(object):
         result = self.convert_linebreaks(result)
         result = self.remove_backspaces(result)
         result = self.convert_urls(result)
-        result = self.convert_links(result)
         # clean out eventual ansi that was missed
         #result = parse_ansi(result, strip_ansi=True)
 
         return result
+
 
 HTML_PARSER = TextToHTMLparser()
 

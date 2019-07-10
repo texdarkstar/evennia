@@ -7,17 +7,17 @@ sets up all the networking features.  (this is done automatically
 by game/evennia.py).
 
 """
-from __future__ import print_function
 from builtins import object
 
-import time
 import sys
 import os
+import time
 
+from os.path import dirname, abspath
 from twisted.application import internet, service
 from twisted.internet import protocol, reactor
-from twisted.internet.task import LoopingCall
-from twisted.web import server
+from twisted.python.log import ILogObserver
+
 import django
 django.setup()
 from django.conf import settings
@@ -27,18 +27,23 @@ evennia._init()
 
 from evennia.utils.utils import get_evennia_version, mod_import, make_iter
 from evennia.server.portal.portalsessionhandler import PORTAL_SESSIONS
+from evennia.utils import logger
 from evennia.server.webserver import EvenniaReverseProxyResource
+from django.db import connection
+
+
+# we don't need a connection to the database so close it right away
+try:
+    connection.close()
+except Exception:
+    pass
 
 PORTAL_SERVICES_PLUGIN_MODULES = [mod_import(module) for module in make_iter(settings.PORTAL_SERVICES_PLUGIN_MODULES)]
 LOCKDOWN_MODE = settings.LOCKDOWN_MODE
 
-if os.name == 'nt':
-    # For Windows we need to handle pid files manually.
-    PORTAL_PIDFILE = os.path.join(settings.GAME_DIR, "server", 'portal.pid')
-
-#------------------------------------------------------------
+# -------------------------------------------------------------
 # Evennia Portal settings
-#------------------------------------------------------------
+# -------------------------------------------------------------
 
 VERSION = get_evennia_version()
 
@@ -71,34 +76,15 @@ AMP_PORT = settings.AMP_PORT
 AMP_INTERFACE = settings.AMP_INTERFACE
 AMP_ENABLED = AMP_HOST and AMP_PORT and AMP_INTERFACE
 
+INFO_DICT = {"servername": SERVERNAME, "version": VERSION, "errors": "", "info": "",
+             "lockdown_mode": "", "amp": "", "telnet": [], "telnet_ssl": [], "ssh": [],
+             "webclient": [], "webserver_proxy": [], "webserver_internal": []}
 
-# Maintenance function - this is called repeatedly by the portal.
-
-_IDLE_TIMEOUT = settings.IDLE_TIMEOUT
-def _portal_maintenance():
-    """
-    The maintenance function handles repeated checks and updates that
-    the server needs to do. It is called every minute.
-
-    """
-    # check for idle sessions
-    now = time.time()
-
-    reason = "Idle timeout exceeded, disconnecting."
-    for session in [sess for sess in PORTAL_SESSIONS.values()
-                    if (now - sess.cmd_last) > _IDLE_TIMEOUT]:
-        session.disconnect(reason=reason)
-        PORTAL_SESSIONS.disconnect(session)
-
-if _IDLE_TIMEOUT > 0:
-    # only start the maintenance task if we care about idling.
-    _maintenance_task = LoopingCall(_portal_maintenance)
-    _maintenance_task.start(60) # called every minute
-
-
-#------------------------------------------------------------
+# -------------------------------------------------------------
 # Portal Service object
-#------------------------------------------------------------
+# -------------------------------------------------------------
+
+
 class Portal(object):
 
     """
@@ -119,45 +105,59 @@ class Portal(object):
         sys.path.append('.')
 
         # create a store of services
-        self.services = service.IServiceCollection(application)
+        self.services = service.MultiService()
+        self.services.setServiceParent(application)
         self.amp_protocol = None  # set by amp factory
         self.sessions = PORTAL_SESSIONS
         self.sessions.portal = self
+        self.process_id = os.getpid()
+
+        self.server_process_id = None
+        self.server_restart_mode = "shutdown"
+        self.server_info_dict = {}
+
+        self.start_time = time.time()
+
+        # in non-interactive portal mode, this gets overwritten by
+        # cmdline sent by the evennia launcher
+        self.server_twistd_cmd = self._get_backup_server_twistd_cmd()
 
         # set a callback if the server is killed abruptly,
         # by Ctrl-C, reboot etc.
-        reactor.addSystemEventTrigger('before', 'shutdown', self.shutdown, _reactor_stopping=True)
+        reactor.addSystemEventTrigger('before', 'shutdown',
+                                      self.shutdown, _reactor_stopping=True, _stop_server=True)
 
-        self.game_running = False
-
-    def set_restart_mode(self, mode=None):
+    def _get_backup_server_twistd_cmd(self):
         """
-        This manages the flag file that tells the runner if the server
-        should be restarted or is shutting down.
+        For interactive Portal mode there is no way to get the server cmdline from the launcher, so
+        we need to guess it here (it's very likely to not change)
 
-        Args:
-            mode (bool or None): Valid modes are True/False and None.
-                If mode is None, no change will be done to the flag file.
-
+        Returns:
+            server_twistd_cmd (list): An instruction for starting the server, to pass to Popen.
         """
-        if mode is None:
-            return
-        with open(PORTAL_RESTART, 'w') as f:
-            print("writing mode=%(mode)s to %(portal_restart)s" % {'mode': mode, 'portal_restart': PORTAL_RESTART})
-            f.write(str(mode))
+        server_twistd_cmd = [
+            "twistd",
+            "--python={}".format(os.path.join(dirname(dirname(abspath(__file__))), "server.py"))]
+        if os.name != 'nt':
+            gamedir = os.getcwd()
+            server_twistd_cmd.append("--pidfile={}".format(
+                os.path.join(gamedir, "server", "server.pid")))
+        return server_twistd_cmd
 
-    def shutdown(self, restart=None, _reactor_stopping=False):
+    def get_info_dict(self):
+        "Return the Portal info, for display."
+        return INFO_DICT
+
+    def shutdown(self, _reactor_stopping=False, _stop_server=False):
         """
         Shuts down the server from inside it.
 
         Args:
-            restart (bool or None, optional): True/False sets the
-                flags so the server will be restarted or not. If None, the
-                current flag setting (set at initialization or previous
-                runs) is used.
             _reactor_stopping (bool, optional): This is set if server
                 is already in the process of shutting down; in this case
                 we don't need to stop it again.
+            _stop_server (bool, optional): Only used in portal-interactive mode;
+                makes sure to stop the Server cleanly.
 
         Note that restarting (regardless of the setting) will not work
         if the Portal is currently running in daemon mode. In that
@@ -168,35 +168,42 @@ class Portal(object):
             # we get here due to us calling reactor.stop below. No need
             # to do the shutdown procedure again.
             return
+
         self.sessions.disconnect_all()
-        self.set_restart_mode(restart)
-        if os.name == 'nt' and os.path.exists(PORTAL_PIDFILE):
-            # for Windows we need to remove pid files manually
-            os.remove(PORTAL_PIDFILE)
+        if _stop_server:
+            self.amp_protocol.stop_server(mode='shutdown')
+
         if not _reactor_stopping:
             # shutting down the reactor will trigger another signal. We set
             # a flag to avoid loops.
             self.shutdown_complete = True
             reactor.callLater(0, reactor.stop)
 
-#------------------------------------------------------------
+# -------------------------------------------------------------
 #
 # Start the Portal proxy server and add all active services
 #
-#------------------------------------------------------------
+# -------------------------------------------------------------
+
 
 # twistd requires us to define the variable 'application' so it knows
 # what to execute from.
 application = service.Application('Portal')
 
+# custom logging
+
+if "--nodaemon" not in sys.argv:
+    logfile = logger.WeeklyLogFile(os.path.basename(settings.PORTAL_LOG_FILE),
+                                   os.path.dirname(settings.PORTAL_LOG_FILE))
+    application.setComponent(ILogObserver, logger.PortalLogObserver(logfile).emit)
+
 # The main Portal server program. This sets up the database
 # and is where we store all the other services.
 PORTAL = Portal(application)
 
-print('-' * 50)
-print(' %(servername)s Portal (%(version)s) started.' % {'servername': SERVERNAME, 'version': VERSION})
 if LOCKDOWN_MODE:
-    print('  LOCKDOWN_MODE active: Only local connections.')
+
+    INFO_DICT["lockdown_mode"] = '  LOCKDOWN_MODE active: Only local connections.'
 
 if AMP_ENABLED:
 
@@ -204,14 +211,14 @@ if AMP_ENABLED:
     # the portal and the mud server. Only reason to ever deactivate
     # it would be during testing and debugging.
 
-    from evennia.server import amp
+    from evennia.server.portal import amp_server
 
-    print('  amp (to Server): %s' % AMP_PORT)
+    INFO_DICT["amp"] = 'amp: %s' % AMP_PORT
 
-    factory = amp.AmpClientFactory(PORTAL)
-    amp_client = internet.TCPClient(AMP_HOST, AMP_PORT, factory)
-    amp_client.setName('evennia_amp')
-    PORTAL.services.addService(amp_client)
+    factory = amp_server.AMPServerFactory(PORTAL)
+    amp_service = internet.TCPServer(AMP_PORT, factory, interface=AMP_INTERFACE)
+    amp_service.setName("PortalAMPServer")
+    PORTAL.services.addService(amp_service)
 
 
 # We group all the various services under the same twisted app.
@@ -229,21 +236,22 @@ if TELNET_ENABLED:
             ifacestr = "-%s" % interface
         for port in TELNET_PORTS:
             pstring = "%s:%s" % (ifacestr, port)
-            factory = protocol.ServerFactory()
+            factory = telnet.TelnetServerFactory()
+            factory.noisy = False
             factory.protocol = telnet.TelnetProtocol
             factory.sessionhandler = PORTAL_SESSIONS
             telnet_service = internet.TCPServer(port, factory, interface=interface)
             telnet_service.setName('EvenniaTelnet%s' % pstring)
             PORTAL.services.addService(telnet_service)
 
-            print('  telnet%s: %s' % (ifacestr, port))
+            INFO_DICT["telnet"].append('telnet%s: %s' % (ifacestr, port))
 
 
 if SSL_ENABLED:
 
-    # Start SSL game connection (requires PyOpenSSL).
+    # Start Telnet+SSL game connection (requires PyOpenSSL).
 
-    from evennia.server.portal import ssl
+    from evennia.server.portal import telnet_ssl
 
     for interface in SSL_INTERFACES:
         ifacestr = ""
@@ -252,16 +260,23 @@ if SSL_ENABLED:
         for port in SSL_PORTS:
             pstring = "%s:%s" % (ifacestr, port)
             factory = protocol.ServerFactory()
+            factory.noisy = False
             factory.sessionhandler = PORTAL_SESSIONS
-            factory.protocol = ssl.SSLProtocol
-            ssl_service = internet.SSLServer(port,
-                                             factory,
-                                             ssl.getSSLContext(),
-                                             interface=interface)
-            ssl_service.setName('EvenniaSSL%s' % pstring)
-            PORTAL.services.addService(ssl_service)
+            factory.protocol = telnet_ssl.SSLProtocol
 
-            print("  ssl%s: %s" % (ifacestr, port))
+            ssl_context = telnet_ssl.getSSLContext()
+            if ssl_context:
+                ssl_service = internet.SSLServer(port,
+                                                 factory,
+                                                 telnet_ssl.getSSLContext(),
+                                                 interface=interface)
+                ssl_service.setName('EvenniaSSL%s' % pstring)
+                PORTAL.services.addService(ssl_service)
+
+                INFO_DICT["telnet_ssl"].append("telnet+ssl%s: %s" % (ifacestr, port))
+            else:
+                INFO_DICT["telnet_ssl"].append(
+                        "telnet+ssl%s: %s (deactivated - keys/cert unset)" % (ifacestr, port))
 
 
 if SSH_ENABLED:
@@ -280,14 +295,16 @@ if SSH_ENABLED:
             factory = ssh.makeFactory({'protocolFactory': ssh.SshProtocol,
                                        'protocolArgs': (),
                                        'sessions': PORTAL_SESSIONS})
+            factory.noisy = False
             ssh_service = internet.TCPServer(port, factory, interface=interface)
             ssh_service.setName('EvenniaSSH%s' % pstring)
             PORTAL.services.addService(ssh_service)
 
-            print("  ssh%s: %s" % (ifacestr, port))
+            INFO_DICT["ssh"].append("ssh%s: %s" % (ifacestr, port))
 
 
 if WEBSERVER_ENABLED:
+    from evennia.server.webserver import Website
 
     # Start a reverse proxy to relay data to the Server-side webserver
 
@@ -297,55 +314,55 @@ if WEBSERVER_ENABLED:
         if interface not in ('0.0.0.0', '::') or len(WEBSERVER_INTERFACES) > 1:
             ifacestr = "-%s" % interface
         for proxyport, serverport in WEBSERVER_PORTS:
-            pstring = "%s:%s<->%s" % (ifacestr, proxyport, serverport)
             web_root = EvenniaReverseProxyResource('127.0.0.1', serverport, '')
             webclientstr = ""
             if WEBCLIENT_ENABLED:
                 # create ajax client processes at /webclientdata
                 from evennia.server.portal import webclient_ajax
 
-                webclient = webclient_ajax.WebClient()
-                webclient.sessionhandler = PORTAL_SESSIONS
-                web_root.putChild("webclientdata", webclient)
-                webclientstr = "\n   + webclient (ajax only)"
+                ajax_webclient = webclient_ajax.AjaxWebClient()
+                ajax_webclient.sessionhandler = PORTAL_SESSIONS
+                web_root.putChild(b"webclientdata", ajax_webclient)
+                webclientstr = "webclient (ajax only)"
 
                 if WEBSOCKET_CLIENT_ENABLED and not websocket_started:
                     # start websocket client port for the webclient
                     # we only support one websocket client
                     from evennia.server.portal import webclient
-                    from evennia.utils.txws import WebSocketFactory
+                    from autobahn.twisted.websocket import WebSocketServerFactory
 
-                    interface = WEBSOCKET_CLIENT_INTERFACE
+                    w_interface = WEBSOCKET_CLIENT_INTERFACE
+                    w_ifacestr = ''
+                    if w_interface not in ('0.0.0.0', '::') or len(WEBSERVER_INTERFACES) > 1:
+                        w_ifacestr = "-%s" % interface
                     port = WEBSOCKET_CLIENT_PORT
-                    ifacestr = ""
-                    if interface not in ('0.0.0.0', '::'):
-                        ifacestr = "-%s" % interface
-                    pstring = "%s:%s" % (ifacestr, port)
-                    factory = protocol.ServerFactory()
+
+                    class Websocket(WebSocketServerFactory):
+                        "Only here for better naming in logs"
+                        pass
+
+                    factory = Websocket()
+                    factory.noisy = False
                     factory.protocol = webclient.WebSocketClient
                     factory.sessionhandler = PORTAL_SESSIONS
-                    websocket_service = internet.TCPServer(port, WebSocketFactory(factory), interface=interface)
-                    websocket_service.setName('EvenniaWebSocket%s' % pstring)
+                    websocket_service = internet.TCPServer(port, factory, interface=w_interface)
+                    websocket_service.setName('EvenniaWebSocket%s:%s' % (w_ifacestr, port))
                     PORTAL.services.addService(websocket_service)
                     websocket_started = True
-                    webclientstr = "\n   + webclient%s" % pstring
+                    webclientstr = "webclient-websocket%s: %s" % (w_ifacestr, port)
+                INFO_DICT["webclient"].append(webclientstr)
 
-            web_root = server.Site(web_root, logPath=settings.HTTP_LOG_FILE)
+            web_root = Website(web_root, logPath=settings.HTTP_LOG_FILE)
+            web_root.is_portal = True
             proxy_service = internet.TCPServer(proxyport,
                                                web_root,
                                                interface=interface)
-            proxy_service.setName('EvenniaWebProxy%s' % pstring)
+            proxy_service.setName('EvenniaWebProxy%s:%s' % (ifacestr, proxyport))
             PORTAL.services.addService(proxy_service)
-            print("  webproxy%s:%s (<-> %s)%s" % (ifacestr, proxyport, serverport, webclientstr))
+            INFO_DICT["webserver_proxy"].append("webserver-proxy%s: %s" % (ifacestr, proxyport))
+            INFO_DICT["webserver_internal"].append("webserver: %s" % serverport)
 
 
 for plugin_module in PORTAL_SERVICES_PLUGIN_MODULES:
     # external plugin services to start
     plugin_module.start_plugin_services(PORTAL)
-
-print('-' * 50)  # end of terminal output
-
-if os.name == 'nt':
-    # Windows only: Set PID file manually
-    with open(PORTAL_PIDFILE, 'w') as f:
-        f.write(str(os.getpid()))

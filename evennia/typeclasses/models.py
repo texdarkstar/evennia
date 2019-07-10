@@ -29,23 +29,27 @@ from builtins import object
 
 from django.db.models import signals
 
+from django.db.models.base import ModelBase
 from django.db import models
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.conf import settings
+from django.urls import reverse
 from django.utils.encoding import smart_str
+from django.utils.text import slugify
 
 from evennia.typeclasses.attributes import Attribute, AttributeHandler, NAttributeHandler
 from evennia.typeclasses.tags import Tag, TagHandler, AliasHandler, PermissionHandler
 
 from evennia.utils.idmapper.models import SharedMemoryModel, SharedMemoryModelBase
+from evennia.server.signals import SIGNAL_TYPED_OBJECT_POST_RENAME
 
 from evennia.typeclasses import managers
 from evennia.locks.lockhandler import LockHandler
 from evennia.utils.utils import (
-        is_iter, inherits_from, lazy_property,
-        class_from_module)
+    is_iter, inherits_from, lazy_property,
+    class_from_module)
 from evennia.utils.logger import log_trace
-from evennia.typeclasses.django_new_patch import patched_new
 
 __all__ = ("TypedObject", )
 
@@ -56,25 +60,35 @@ _TYPECLASS_AGGRESSIVE_CACHE = settings.TYPECLASS_AGGRESSIVE_CACHE
 _GA = object.__getattribute__
 _SA = object.__setattr__
 
-#------------------------------------------------------------
+
+# signal receivers. Connected in __new__
+
+def call_at_first_save(sender, instance, created, **kwargs):
+    """
+    Receives a signal just after the object is saved.
+    """
+    if created:
+        instance.at_first_save()
+
+
+def remove_attributes_on_delete(sender, instance, **kwargs):
+    """
+    Wipe object's Attributes when it's deleted
+    """
+    instance.db_attributes.all().delete()
+
+
+# ------------------------------------------------------------
 #
 # Typed Objects
 #
-#------------------------------------------------------------
+# ------------------------------------------------------------
 
 
 #
 # Meta class for typeclasses
 #
 
-
-# signal receivers. Assigned in __new__
-def post_save(sender, instance, created, **kwargs):
-    """
-    Receives a signal just after the object is saved.
-    """
-    if created:
-        instance.at_first_save()
 
 class TypeclassBase(SharedMemoryModelBase):
     """
@@ -91,30 +105,27 @@ class TypeclassBase(SharedMemoryModelBase):
 
         # storage of stats
         attrs["typename"] = name
-        attrs["path"] =  "%s.%s" % (attrs["__module__"], name)
+        attrs["path"] = "%s.%s" % (attrs["__module__"], name)
 
         # typeclass proxy setup
-        if not "Meta" in attrs:
+        if "Meta" not in attrs:
             class Meta(object):
                 proxy = True
                 app_label = attrs.get("__applabel__", "typeclasses")
             attrs["Meta"] = Meta
         attrs["Meta"].proxy = True
 
-        # patch for django proxy multi-inheritance
-        # this is a copy of django.db.models.base.__new__
-        # with a few lines changed as per
-        # https://code.djangoproject.com/ticket/11560
-        new_class = patched_new(cls, name, bases, attrs)
+        new_class = ModelBase.__new__(cls, name, bases, attrs)
 
-        # attach signal
-        signals.post_save.connect(post_save, sender=new_class)
-
+        # attach signals
+        signals.post_save.connect(call_at_first_save, sender=new_class)
+        signals.pre_delete.connect(remove_attributes_on_delete, sender=new_class)
         return new_class
 
 
 class DbHolder(object):
     "Holder for allowing property access of attributes"
+
     def __init__(self, obj, name, manager_name='attributes'):
         _SA(self, name, _GA(obj, manager_name))
         _SA(self, 'name', name)
@@ -175,17 +186,17 @@ class TypedObject(SharedMemoryModel):
     # This is the python path to the type class this object is tied to. The
     # typeclass is what defines what kind of Object this is)
     db_typeclass_path = models.CharField('typeclass', max_length=255, null=True,
-            help_text="this defines what 'type' of entity this is. This variable holds a Python path to a module with a valid Evennia Typeclass.")
+                                         help_text="this defines what 'type' of entity this is. This variable holds a Python path to a module with a valid Evennia Typeclass.")
     # Creation date. This is not changed once the object is created.
     db_date_created = models.DateTimeField('creation date', editable=False, auto_now_add=True)
     # Lock storage
     db_lock_storage = models.TextField('locks', blank=True,
-            help_text="locks limit access to an entity. A lock is defined as a 'lock string' on the form 'type:lockfunctions', defining what functionality is locked and how to determine access. Not defining a lock means no access is granted.")
+                                       help_text="locks limit access to an entity. A lock is defined as a 'lock string' on the form 'type:lockfunctions', defining what functionality is locked and how to determine access. Not defining a lock means no access is granted.")
     # many2many relationships
-    db_attributes = models.ManyToManyField(Attribute, null=True,
-            help_text='attributes on this object. An attribute can hold any pickle-able python object (see docs for special cases).')
-    db_tags = models.ManyToManyField(Tag, null=True,
-            help_text='tags on this object. Tags are simple string markers to identify, group and alias objects.')
+    db_attributes = models.ManyToManyField(Attribute,
+                                           help_text='attributes on this object. An attribute can hold any pickle-able python object (see docs for special cases).')
+    db_tags = models.ManyToManyField(Tag,
+                                     help_text='tags on this object. Tags are simple string markers to identify, group and alias objects.')
 
     # Database manager
     objects = managers.TypedObjectManager()
@@ -194,6 +205,45 @@ class TypedObject(SharedMemoryModel):
     _cached_typeclass = None
 
     # typeclass mechanism
+
+    def set_class_from_typeclass(self, typeclass_path=None):
+        if typeclass_path:
+            try:
+                self.__class__ = class_from_module(typeclass_path, defaultpaths=settings.TYPECLASS_PATHS)
+            except Exception:
+                log_trace()
+                try:
+                    self.__class__ = class_from_module(self.__settingsclasspath__)
+                except Exception:
+                    log_trace()
+                    try:
+                        self.__class__ = class_from_module(self.__defaultclasspath__)
+                    except Exception:
+                        log_trace()
+                        self.__class__ = self._meta.concrete_model or self.__class__
+            finally:
+                self.db_typeclass_path = typeclass_path
+        elif self.db_typeclass_path:
+            try:
+                self.__class__ = class_from_module(self.db_typeclass_path)
+            except Exception:
+                log_trace()
+                try:
+                    self.__class__ = class_from_module(self.__defaultclasspath__)
+                except Exception:
+                    log_trace()
+                    self.__dbclass__ = self._meta.concrete_model or self.__class__
+        else:
+            self.db_typeclass_path = "%s.%s" % (self.__module__, self.__class__.__name__)
+        # important to put this at the end since _meta is based on the set __class__
+        try:
+            self.__dbclass__ = self._meta.concrete_model or self.__class__
+        except AttributeError:
+            err_class = repr(self.__class__)
+            self.__class__ = class_from_module("evennia.objects.objects.DefaultObject")
+            self.__dbclass__ = class_from_module("evennia.objects.models.ObjectDB")
+            self.db_typeclass_path = "evennia.objects.objects.DefaultObject"
+            log_trace("Critical: Class %s of %s is not a valid typeclass!\nTemporarily falling back to %s." % (err_class, self, self.__class__))
 
     def __init__(self, *args, **kwargs):
         """
@@ -227,44 +277,8 @@ class TypedObject(SharedMemoryModel):
 
         """
         typeclass_path = kwargs.pop("typeclass", None)
-        super(TypedObject, self).__init__(*args, **kwargs)
-        if typeclass_path:
-            try:
-                self.__class__ = class_from_module(typeclass_path, defaultpaths=settings.TYPECLASS_PATHS)
-            except Exception:
-                log_trace()
-                try:
-                    self.__class__ = class_from_module(self.__settingsclasspath__)
-                except Exception:
-                    log_trace()
-                    try:
-                        self.__class__ = class_from_module(self.__defaultclasspath__)
-                    except Exception:
-                        log_trace()
-                        self.__class__ = self._meta.proxy_for_model or self.__class__
-            finally:
-                self.db_typeclass_path = typeclass_path
-        elif self.db_typeclass_path:
-            try:
-                self.__class__ = class_from_module(self.db_typeclass_path)
-            except Exception:
-                log_trace()
-                try:
-                    self.__class__ = class_from_module(self.__defaultclasspath__)
-                except Exception:
-                    log_trace()
-                    self.__dbclass__ = self._meta.proxy_for_model or self.__class__
-        else:
-            self.db_typeclass_path = "%s.%s" % (self.__module__, self.__class__.__name__)
-        # important to put this at the end since _meta is based on the set __class__
-        try:
-            self.__dbclass__ = self._meta.proxy_for_model or self.__class__
-        except AttributeError:
-            err_class = repr(self.__class__)
-            self.__class__ = class_from_module("evennia.objects.objects.DefaultObject")
-            self.__dbclass__ = class_from_module("evennia.objects.models.ObjectDB")
-            self.db_typeclass_path = "evennia.objects.objects.DefaultObject"
-            log_trace("Critical: Class %s of %s is not a valid typeclass!\nTemporarily falling back to %s." % (err_class, self, self.__class__))
+        super().__init__(*args, **kwargs)
+        self.set_class_from_typeclass(typeclass_path=typeclass_path)
 
     # initialize all handlers in a lazy fashion
     @lazy_property
@@ -290,7 +304,6 @@ class TypedObject(SharedMemoryModel):
     @lazy_property
     def nattributes(self):
         return NAttributeHandler(self)
-
 
     class Meta(object):
         """
@@ -331,6 +344,7 @@ class TypedObject(SharedMemoryModel):
         self.db_key = value
         self.save(update_fields=["db_key"])
         self.at_rename(oldname, value)
+        SIGNAL_TYPED_OBJECT_POST_RENAME.send(sender=self, old_key=oldname, new_key=value)
 
     #
     #
@@ -339,13 +353,16 @@ class TypedObject(SharedMemoryModel):
     #
 
     def __eq__(self, other):
-        return other and hasattr(other, 'dbid') and self.dbid == other.dbid
+        try:
+            return self.__dbclass__ == other.__dbclass__ and self.dbid == other.dbid
+        except AttributeError:
+            return False
 
     def __str__(self):
         return smart_str("%s" % self.db_key)
 
-    def __unicode__(self):
-        return u"%s" % self.db_key
+    def __repr__(self):
+        return "%s" % self.db_key
 
     #@property
     def __dbid_get(self):
@@ -376,6 +393,41 @@ class TypedObject(SharedMemoryModel):
         raise Exception("dbref cannot be deleted!")
     dbref = property(__dbref_get, __dbref_set, __dbref_del)
 
+    def at_idmapper_flush(self):
+        """
+        This is called when the idmapper cache is flushed and
+        allows customized actions when this happens.
+
+        Returns:
+            do_flush (bool): If True, flush this object as normal. If
+                False, don't flush and expect this object to handle
+                the flushing on its own.
+
+        Notes:
+            The default implementation relies on being able to clear
+            Django's Foreignkey cache on objects not affected by the
+            flush (notably objects with an NAttribute stored). We rely
+            on this cache being stored on the format "_<fieldname>_cache".
+            If Django were to change this name internally, we need to
+            update here (unlikely, but marking just in case).
+
+        """
+        if self.nattributes.all():
+            # we can't flush this object if we have non-persistent
+            # attributes stored - those would get lost! Nevertheless
+            # we try to flush as many references as we can.
+            self.attributes.reset_cache()
+            self.tags.reset_cache()
+            # flush caches for all related fields
+            for field in self._meta.fields:
+                name = "_%s_cache" % field.name
+                if field.is_relation and name in self.__dict__:
+                    # a foreignkey - remove its cache
+                    del self.__dict__[name]
+            return False
+        # a normal flush
+        return True
+
     #
     # Object manipulation methods
     #
@@ -400,7 +452,7 @@ class TypedObject(SharedMemoryModel):
                 typeclass.
 
         """
-        if isinstance(typeclass, basestring):
+        if isinstance(typeclass, str):
             typeclass = [typeclass] + ["%s.%s" % (prefix, typeclass) for prefix in settings.TYPECLASS_PATHS]
         else:
             typeclass = [typeclass.path]
@@ -418,15 +470,15 @@ class TypedObject(SharedMemoryModel):
         """
         This performs an in-situ swap of the typeclass. This means
         that in-game, this object will suddenly be something else.
-        Player will not be affected. To 'move' a player to a different
+        Account will not be affected. To 'move' an account to a different
         object entirely (while retaining this object's type), use
-        self.player.swap_object().
+        self.account.swap_object().
 
         Note that this might be an error prone operation if the
         old/new typeclass was heavily customized - your code
         might expect one and not the other, so be careful to
         bug test your code if using this feature! Often its easiest
-        to create a new object and just swap the player over to
+        to create a new object and just swap the account over to
         that one instead.
 
         Args:
@@ -457,11 +509,10 @@ class TypedObject(SharedMemoryModel):
 
         # if we get to this point, the class is ok.
 
-
         if inherits_from(self, "evennia.scripts.models.ScriptDB"):
             if self.interval > 0:
-                raise RuntimeError("Cannot use swap_typeclass on time-dependent " \
-                                   "Script '%s'.\nStop and start a new Script of the " \
+                raise RuntimeError("Cannot use swap_typeclass on time-dependent "
+                                   "Script '%s'.\nStop and start a new Script of the "
                                    "right type instead." % self.key)
 
         self.typeclass_path = new_typeclass.path
@@ -527,8 +578,8 @@ class TypedObject(SharedMemoryModel):
             result (bool): If the permstring is passed or not.
 
         """
-        if hasattr(self, "player"):
-            if self.player and self.player.is_superuser and not self.player.attributes.get("_quell"):
+        if hasattr(self, "account"):
+            if self.account and self.account.is_superuser and not self.account.attributes.get("_quell"):
                 return True
         else:
             if self.is_superuser and not self.attributes.get("_quell"):
@@ -546,6 +597,10 @@ class TypedObject(SharedMemoryModel):
             ppos = _PERMISSION_HIERARCHY.index(perm)
             return any(True for hpos, hperm in enumerate(_PERMISSION_HIERARCHY)
                        if hperm in perms and hpos > ppos)
+        # we ignore pluralization (english only)
+        if perm.endswith("s"):
+            return self.check_permstring(perm[:-1])
+
         return False
 
     #
@@ -569,22 +624,9 @@ class TypedObject(SharedMemoryModel):
         self.aliases.clear()
         if hasattr(self, "nicks"):
             self.nicks.clear()
-
         # scrambling properties
         self.delete = self._deleted
-        super(TypedObject, self).delete()
-
-    #
-    # Memory management
-    #
-
-    #def flush_from_cache(self):
-    #    """
-    #    Flush this object instance from cache, forcing an object reload.
-    #    Note that this will kill all temporary attributes on this object
-    #     since it will be recreated as a new Typeclass instance.
-    #    """
-    #    self.__class__.flush_cached_instance(self)
+        super().delete()
 
     #
     # Attribute storage
@@ -658,8 +700,9 @@ class TypedObject(SharedMemoryModel):
         Displays the name of the object in a viewer-aware manner.
 
         Args:
-            looker (TypedObject): The object or player that is looking
-                at/getting inforamtion for this object.
+            looker (TypedObject, optional): The object or account that is looking
+                at/getting inforamtion for this object. If not given, some
+                'safe' minimum level should be returned.
 
         Returns:
             name (str): A string containing the name of the object,
@@ -689,7 +732,7 @@ class TypedObject(SharedMemoryModel):
         not in your normal inventory listing.
 
         Args:
-            looker (TypedObject): The object or player that is looking
+            looker (TypedObject): The object or account that is looking
                 at/getting information for this object.
 
         Returns:
@@ -712,3 +755,182 @@ class TypedObject(SharedMemoryModel):
 
         """
         pass
+
+    #
+    # Web/Django methods
+    #
+
+    def web_get_admin_url(self):
+        """
+        Returns the URI path for the Django Admin page for this object.
+
+        ex. Account#1 = '/admin/accounts/accountdb/1/change/'
+
+        Returns:
+            path (str): URI path to Django Admin page for object.
+
+        """
+        content_type = ContentType.objects.get_for_model(self.__class__)
+        return reverse("admin:%s_%s_change" % (content_type.app_label,
+                                               content_type.model), args=(self.id,))
+
+    @classmethod
+    def web_get_create_url(cls):
+        """
+        Returns the URI path for a View that allows users to create new
+        instances of this object.
+
+        ex. Chargen = '/characters/create/'
+
+        For this to work, the developer must have defined a named view somewhere
+        in urls.py that follows the format 'modelname-action', so in this case
+        a named view of 'character-create' would be referenced by this method.
+
+        ex.
+        url(r'characters/create/', ChargenView.as_view(), name='character-create')
+
+        If no View has been created and defined in urls.py, returns an
+        HTML anchor.
+
+        This method is naive and simply returns a path. Securing access to
+        the actual view and limiting who can create new objects is the
+        developer's responsibility.
+
+        Returns:
+            path (str): URI path to object creation page, if defined.
+
+        """
+        try:
+            return reverse('%s-create' % slugify(cls._meta.verbose_name))
+        except:
+            return '#'
+
+    def web_get_detail_url(self):
+        """
+        Returns the URI path for a View that allows users to view details for
+        this object.
+
+        ex. Oscar (Character) = '/characters/oscar/1/'
+
+        For this to work, the developer must have defined a named view somewhere
+        in urls.py that follows the format 'modelname-action', so in this case
+        a named view of 'character-detail' would be referenced by this method.
+
+        ex.
+        url(r'characters/(?P<slug>[\w\d\-]+)/(?P<pk>[0-9]+)/$',
+            CharDetailView.as_view(), name='character-detail')
+
+        If no View has been created and defined in urls.py, returns an
+        HTML anchor.
+
+        This method is naive and simply returns a path. Securing access to
+        the actual view and limiting who can view this object is the developer's
+        responsibility.
+
+        Returns:
+            path (str): URI path to object detail page, if defined.
+
+        """
+        try:
+            return reverse('%s-detail' % slugify(self._meta.verbose_name),
+                           kwargs={'pk': self.pk, 'slug': slugify(self.name)})
+        except:
+            return '#'
+
+    def web_get_puppet_url(self):
+        """
+        Returns the URI path for a View that allows users to puppet a specific
+        object.
+
+        ex. Oscar (Character) = '/characters/oscar/1/puppet/'
+
+        For this to work, the developer must have defined a named view somewhere
+        in urls.py that follows the format 'modelname-action', so in this case
+        a named view of 'character-puppet' would be referenced by this method.
+
+        ex.
+        url(r'characters/(?P<slug>[\w\d\-]+)/(?P<pk>[0-9]+)/puppet/$',
+            CharPuppetView.as_view(), name='character-puppet')
+
+        If no View has been created and defined in urls.py, returns an
+        HTML anchor.
+
+        This method is naive and simply returns a path. Securing access to
+        the actual view and limiting who can view this object is the developer's
+        responsibility.
+
+        Returns:
+            path (str): URI path to object puppet page, if defined.
+
+        """
+        try:
+            return reverse('%s-puppet' % slugify(self._meta.verbose_name),
+                           kwargs={'pk': self.pk, 'slug': slugify(self.name)})
+        except:
+            return '#'
+
+    def web_get_update_url(self):
+        """
+        Returns the URI path for a View that allows users to update this
+        object.
+
+        ex. Oscar (Character) = '/characters/oscar/1/change/'
+
+        For this to work, the developer must have defined a named view somewhere
+        in urls.py that follows the format 'modelname-action', so in this case
+        a named view of 'character-update' would be referenced by this method.
+
+        ex.
+        url(r'characters/(?P<slug>[\w\d\-]+)/(?P<pk>[0-9]+)/change/$',
+            CharUpdateView.as_view(), name='character-update')
+
+        If no View has been created and defined in urls.py, returns an
+        HTML anchor.
+
+        This method is naive and simply returns a path. Securing access to
+        the actual view and limiting who can modify objects is the developer's
+        responsibility.
+
+        Returns:
+            path (str): URI path to object update page, if defined.
+
+        """
+        try:
+            return reverse('%s-update' % slugify(self._meta.verbose_name),
+                           kwargs={'pk': self.pk, 'slug': slugify(self.name)})
+        except:
+            return '#'
+
+    def web_get_delete_url(self):
+        """
+        Returns the URI path for a View that allows users to delete this object.
+
+        ex. Oscar (Character) = '/characters/oscar/1/delete/'
+
+        For this to work, the developer must have defined a named view somewhere
+        in urls.py that follows the format 'modelname-action', so in this case
+        a named view of 'character-detail' would be referenced by this method.
+
+        ex.
+        url(r'characters/(?P<slug>[\w\d\-]+)/(?P<pk>[0-9]+)/delete/$',
+            CharDeleteView.as_view(), name='character-delete')
+
+        If no View has been created and defined in urls.py, returns an
+        HTML anchor.
+
+        This method is naive and simply returns a path. Securing access to
+        the actual view and limiting who can delete this object is the developer's
+        responsibility.
+
+        Returns:
+            path (str): URI path to object deletion page, if defined.
+
+        """
+        try:
+            return reverse('%s-delete' % slugify(self._meta.verbose_name),
+                           kwargs={'pk': self.pk, 'slug': slugify(self.name)})
+        except:
+            return '#'
+
+    # Used by Django Sites/Admin
+    get_absolute_url = web_get_detail_url

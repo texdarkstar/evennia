@@ -25,40 +25,29 @@
 """
 Pickle field implementation for Django.
 
-Modified for Evennia by Griatch.
+Modified for Evennia by Griatch and the Evennia community.
 
 """
 from builtins import object
 from ast import literal_eval
+from datetime import datetime
 
 from copy import deepcopy
 from base64 import b64encode, b64decode
 from zlib import compress, decompress
-#import six # this is actually a pypy component, not in default syslib
-import django
+# import six # this is actually a pypy component, not in default syslib
 from django.core.exceptions import ValidationError
 from django.db import models
 
-# django 1.5 introduces force_text instead of force_unicode
-from django.forms import CharField, Textarea
-from django.forms.utils import flatatt
-from django.utils.html import format_html
+from django.forms.fields import CharField
+from django.forms.widgets import Textarea
 
-from evennia.utils.dbserialize import from_pickle, to_pickle
-from future.utils import with_metaclass
+from pickle import loads, dumps
+from django.utils.encoding import force_text
 
-try:
-    from django.utils.encoding import force_text
-except ImportError:
-    from django.utils.encoding import force_unicode as force_text
 
-# python 3.x does not have cPickle module
-try:
-    from cPickle import loads, dumps # cpython 2.x
-except ImportError:
-    from pickle import loads, dumps # cpython 3.x, other interpreters
+DEFAULT_PROTOCOL = 4
 
-DEFAULT_PROTOCOL = 2
 
 class PickledObject(str):
     """
@@ -105,12 +94,12 @@ def dbsafe_encode(value, compress_object=False, pickle_protocol=DEFAULT_PROTOCOL
     value = dumps(deepcopy(value), protocol=pickle_protocol)
     if compress_object:
         value = compress(value)
-    value = b64encode(value).decode() # decode bytes to str
+    value = b64encode(value).decode()  # decode bytes to str
     return PickledObject(value)
 
 
 def dbsafe_decode(value, compress_object=False):
-    value = value.encode() # encode str to bytes
+    value = value.encode()  # encode str to bytes
     value = b64decode(value)
     if compress_object:
         value = decompress(value)
@@ -118,20 +107,46 @@ def dbsafe_decode(value, compress_object=False):
 
 
 class PickledWidget(Textarea):
-    def render(self, name, value, attrs=None):
-        value = repr(value)
-        try:
-            literal_eval(value)
-        except ValueError:
-            return value
+    """
+    This is responsible for outputting HTML representing a given field.
+    """
+    def render(self, name, value, attrs=None, renderer=None):
+        """Display of the PickledField in django admin"""
 
-        final_attrs = self.build_attrs(attrs, name=name)
-        return format_html('<textarea{0}>\r\n{1}</textarea>',
-                           flatatt(final_attrs),
-                           force_text(value))
+        repr_value = repr(value)
+
+        # analyze represented value to see how big the field should be
+        if attrs is not None:
+            attrs["name"] = name
+        else:
+            attrs = {"name": name}
+        attrs['cols'] = 30
+        # adapt number of rows to number of lines in string
+        rows = 1
+        if isinstance(value, str) and "\n" in repr_value:
+            rows = max(1, len(value.split('\n')))
+        attrs['rows'] = rows
+        attrs = self.build_attrs(attrs)
+
+        try:
+            # necessary to convert it back after repr(), otherwise validation errors will mutate it
+            value = literal_eval(repr_value)
+        except ValueError:
+            pass
+        return super().render(name, value, attrs=attrs, renderer=renderer)
+
+    def value_from_datadict(self, data, files, name):
+        dat = data.get(name)
+        # import evennia;evennia.set_trace()
+        return dat
 
 
 class PickledFormField(CharField):
+    """
+    This represents one input field for the form.
+
+    """
+
     widget = PickledWidget
     default_error_messages = dict(CharField.default_error_messages)
     default_error_messages['invalid'] = (
@@ -144,13 +159,28 @@ class PickledFormField(CharField):
     def __init__(self, *args, **kwargs):
         # This needs to fall through to literal_eval.
         kwargs['required'] = False
-        super(PickledFormField, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def clean(self, value):
-        if value == '':
-            # Field was left blank. Make this None.
-            value = 'None'
+        value = super().clean(value)
+
+        # handle empty input
         try:
+            if not value.strip():
+                # Field was left blank. Make this None.
+                value = 'None'
+        except AttributeError:
+            pass
+
+        # parse raw Python
+        try:
+            return literal_eval(value)
+        except (ValueError, SyntaxError):
+            pass
+
+        # fall through to parsing the repr() of the data
+        try:
+            value = repr(value)
             return literal_eval(value)
         except (ValueError, SyntaxError):
             raise ValidationError(self.error_messages['invalid'])
@@ -170,16 +200,16 @@ class PickledObjectField(models.Field):
     def __init__(self, *args, **kwargs):
         self.compress = kwargs.pop('compress', False)
         self.protocol = kwargs.pop('protocol', DEFAULT_PROTOCOL)
-        super(PickledObjectField, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def get_default(self):
         """
         Returns the default value for this field.
 
-        The default implementation on models.Field calls force_unicode
+        The default implementation on models.Field calls force_text
         on the default, which means you can't set arbitrary Python
         objects as the default. To fix this, we just return the value
-        without calling force_unicode on it. Note that if you set a
+        without calling force_text on it. Note that if you set a
         callable as a default, the field will still call it. It will
         *not* try to pickle and encode it.
 
@@ -189,9 +219,8 @@ class PickledObjectField(models.Field):
                 return self.default()
             return self.default
         # If the field doesn't have a default, then we punt to models.Field.
-        return super(PickledObjectField, self).get_default()
+        return super().get_default()
 
-    #def to_python(self, value):
     def from_db_value(self, value, *args):
         """
         B64decode and unpickle the object, optionally decompressing it.
@@ -205,7 +234,7 @@ class PickledObjectField(models.Field):
         if value is not None:
             try:
                 value = dbsafe_decode(value, self.compress)
-            except:
+            except Exception:
                 # If the value is a definite pickle; and an error is raised in
                 # de-pickling it should be allowed to propogate.
                 if isinstance(value, PickledObject):
@@ -219,7 +248,7 @@ class PickledObjectField(models.Field):
         return PickledFormField(**kwargs)
 
     def pre_save(self, model_instance, add):
-        value = super(PickledObjectField, self).pre_save(model_instance, add)
+        value = super().pre_save(model_instance, add)
         return wrap_conflictual_object(value)
 
     def get_db_prep_value(self, value, connection=None, prepared=False):
@@ -255,14 +284,5 @@ class PickledObjectField(models.Field):
             raise TypeError('Lookup type %s is not supported.' % lookup_type)
         # The Field model already calls get_db_prep_value before doing the
         # actual lookup, so all we need to do is limit the lookup types.
-        return super(PickledObjectField, self).get_db_prep_lookup(
+        return super().get_db_prep_lookup(
             lookup_type, value, connection=connection, prepared=prepared)
-
-
-# South support; see http://south.aeracode.org/docs/tutorial/part4.html#simple-inheritance
-try:
-    from south.modelsinspector import add_introspection_rules
-except ImportError:
-    pass
-else:
-    add_introspection_rules([], [r"^evennia\.utils\.picklefield\.PickledObjectField"])

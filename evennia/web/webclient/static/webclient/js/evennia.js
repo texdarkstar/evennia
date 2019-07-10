@@ -10,12 +10,12 @@ old and does not support websockets, it will instead fall back to a
 long-polling (AJAX/COMET) type of connection (using
 evennia/server/portal/webclient_ajax.py)
 
-All messages is a valid JSON array on single form:
+All messages are valid JSON arrays on this single form:
 
     ["cmdname", args, kwargs],
 
-where args is an JSON array and kwargs is a JSON object that will be
-used as argument to call the cmdname function.
+where args is an JSON array and kwargs is a JSON object. These will be both
+used as arguments emitted to a callback named "cmdname" as cmdname(args, kwargs).
 
 This library makes the "Evennia" object available. It has the
 following official functions:
@@ -45,7 +45,7 @@ An "emitter" object must have a function
         relay the data to its correct gui element.
     - The default emitter also has the following methods:
         - on(cmdname, listener) - this ties a listener to the backend. This function
-            should be called as listener(kwargs) when the backend calls emit.
+            should be called as listener(args, kwargs) when the backend calls emit.
         - off(cmdname) - remove the listener for this cmdname.
 */
 
@@ -102,7 +102,7 @@ An "emitter" object must have a function
                 return;
             }
             this.connection.connect();
-            log('Evenna reconnecting.')
+            log('Evennia reconnecting.')
         },
 
         // Returns true if the connection is open.
@@ -124,7 +124,9 @@ An "emitter" object must have a function
             if (!cmdname) {
                 return;
             }
-            kwargs.cmdid = cmdid++;
+            if (kwargs) {
+                kwargs.cmdid = cmdid++;
+            }
             var outargs = args ? args : [];
             var outkwargs = kwargs ? kwargs : {};
             var data = [cmdname, outargs, outkwargs];
@@ -327,7 +329,7 @@ An "emitter" object must have a function
 
         // Send Client -> Evennia. Called by Evennia.msg
         var msg = function(data, inmode) {
-            log("ajax.msg:", data, JSON.stringify(data));
+            // log("ajax.msg:", data, JSON.stringify(data));
             $.ajax({type: "POST", url: "/webclientdata",
                    async: true, cache: false, timeout: 30000,
                    dataType: "json",

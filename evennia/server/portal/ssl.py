@@ -3,20 +3,18 @@ This is a simple context factory for auto-creating
 SSL keys and certificates.
 
 """
-from __future__ import print_function
-
 import os
 import sys
 try:
     import OpenSSL
     from twisted.internet import ssl as twisted_ssl
-except ImportError as err:
+except ImportError as error:
     errstr = """
     {err}
     SSL requires the PyOpenSSL library:
         pip install pyopenssl
     """
-    raise ImportError(errstr.format(err=err))
+    raise ImportError(errstr.format(err=error))
 
 from django.conf import settings
 from evennia.server.portal.telnet import TelnetProtocol
@@ -50,9 +48,11 @@ class SSLProtocol(TelnetProtocol):
     Communication is the same as telnet, except data transfer
     is done with encryption.
     """
+
     def __init__(self, *args, **kwargs):
-        super(TelnetProtocol, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.protocol_name = "ssl"
+
 
 def verify_SSL_key_and_cert(keyfile, certfile):
     """
@@ -82,7 +82,7 @@ def verify_SSL_key_and_cert(keyfile, certfile):
         # try to create the certificate
         CERT_EXPIRE = 365 * 20  # twenty years validity
         # default:
-        #openssl req -new -x509 -key ssl.key -out ssl.cert -days 7300
+        # openssl req -new -x509 -key ssl.key -out ssl.cert -days 7300
         exestring = "openssl req -new -x509 -key %s -out %s -days %s" % (keyfile, certfile, CERT_EXPIRE)
         try:
             subprocess.call(exestring)

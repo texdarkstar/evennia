@@ -21,11 +21,13 @@ if RSS_ENABLED:
     except ImportError:
         raise ImportError("RSS requires python-feedparser to be installed. Install or set RSS_ENABLED=False.")
 
+
 class RSSReader(Session):
     """
     A simple RSS reader using the feedparser module.
 
     """
+
     def __init__(self, factory, url, rate):
         """
         Initialize the reader.
@@ -80,7 +82,7 @@ class RSSReader(Session):
         if not init:
             # for initialization we just ignore old entries
             for entry in reversed(new_entries):
-                self.data_in("bot_data_in " + entry)
+                self.data_in(entry)
 
     def data_in(self, text=None, **kwargs):
         """
@@ -91,7 +93,7 @@ class RSSReader(Session):
             kwargs (any): Options from protocol.
 
         """
-        self.sessionhandler.data_in(self, text=text, **kwargs)
+        self.sessionhandler.data_in(self, bot_data_in=text, **kwargs)
 
     def _errback(self, fail):
         "Report error"
@@ -111,6 +113,7 @@ class RSSReader(Session):
 
         """
         return threads.deferToThread(self.get_new).addCallback(self._callback, init).addErrback(self._errback)
+
 
 class RSSBotFactory(object):
     """
@@ -137,7 +140,7 @@ class RSSBotFactory(object):
 
     def start(self):
         """
-        Called by portalsessionhandler. Starts te bot.
+        Called by portalsessionhandler. Starts the bot.
         """
         def errback(fail):
             logger.log_err(fail.value)

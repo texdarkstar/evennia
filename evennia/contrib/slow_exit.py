@@ -17,10 +17,9 @@ using something like this:
 
 Installation:
 
-To make all new exits of this type, add the following line to your
-settings:
-
-BASE_EXIT_TYPECLASS = "contrib.slow_exit.SlowExit"
+To make this your new default exit, modify mygame/typeclasses/exits.py
+to import this module and change the default Exit class to inherit
+from SlowExit instead.
 
 To get the ability to change your speed and abort your movement,
 simply import and add CmdSetSpeed and CmdStop from this module to your
@@ -43,10 +42,12 @@ MOVE_DELAY = {"stroll": 6,
               "run": 2,
               "sprint": 1}
 
+
 class SlowExit(DefaultExit):
     """
     This overloads the way moving happens.
     """
+
     def at_traverse(self, traversing_object, target_location):
         """
         Implements the actual traversal, using utils.delay to delay the move_to.
@@ -72,7 +73,7 @@ class SlowExit(DefaultExit):
 
         traversing_object.msg("You start moving %s at a %s." % (self.key, move_speed))
         # create a delayed movement
-        deferred = utils.delay(move_delay, callback=move_callback)
+        deferred = utils.delay(move_delay, move_callback)
         # we store the deferred on the character, this will allow us
         # to abort the movement. We must use an ndb here since
         # deferreds cannot be pickled.
@@ -87,6 +88,7 @@ SPEED_DESCS = {"stroll": "strolling",
                "walk": "walking",
                "run": "running",
                "sprint": "sprinting"}
+
 
 class CmdSetSpeed(Command):
     """
@@ -107,7 +109,7 @@ class CmdSetSpeed(Command):
         """
         speed = self.args.lower().strip()
         if speed not in SPEED_DESCS:
-            self.caller.msg("Usage: setspeed stroll|walk|run|sprint")
+            self.caller.msg("Usage: setspeed stroll||walk||run||sprint")
         elif self.caller.db.move_speed == speed:
             self.caller.msg("You are already %s." % SPEED_DESCS[speed])
         else:
@@ -136,9 +138,10 @@ class CmdStop(Command):
         stored deferred from the exit traversal above.
         """
         currently_moving = self.caller.ndb.currently_moving
-        if currently_moving:
+        if currently_moving and not currently_moving.called:
             currently_moving.cancel()
             self.caller.msg("You stop moving.")
-            self.caller.location.msg_contents("%s stops." % self.get_display_name())
+            for observer in self.caller.location.contents_get(self.caller):
+                observer.msg("%s stops." % self.caller.get_display_name(observer))
         else:
             self.caller.msg("You are not moving.")

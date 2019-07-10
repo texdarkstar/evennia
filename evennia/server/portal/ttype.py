@@ -13,9 +13,9 @@ under the 'TTYPE' key.
 from builtins import object
 
 # telnet option codes
-TTYPE = chr(24)
-IS = chr(0)
-SEND = chr(1)
+TTYPE = b'\x18'
+IS = b'\x00'
+SEND = b'\x01'
 
 # terminal capabilities and their codes
 MTTS = [(128, 'PROXY'),
@@ -27,12 +27,14 @@ MTTS = [(128, 'PROXY'),
         (2, 'VT100'),
         (1, 'ANSI')]
 
+
 class Ttype(object):
     """
     Handles ttype negotiations. Called and initiated by the
     telnet protocol.
 
     """
+
     def __init__(self, protocol):
         """
         Initialize ttype by storing protocol on ourselves and calling
@@ -48,6 +50,8 @@ class Ttype(object):
         """
         self.ttype_step = 0
         self.protocol = protocol
+        # we set FORCEDENDLINE for clients not supporting ttype
+        self.protocol.protocol_flags["FORCEDENDLINE"] = True
         self.protocol.protocol_flags['TTYPE'] = False
         # is it a safe bet to assume ANSI is always supported?
         self.protocol.protocol_flags['ANSI'] = True
@@ -64,7 +68,7 @@ class Ttype(object):
             option (Option): Not used.
 
         """
-        self.protocol.protocol_flags['TTYPE'] = True
+        self.protocol.protocol_flags['TTYPE'] = False
         self.protocol.handshake_done()
 
     def will_ttype(self, option):
@@ -87,8 +91,9 @@ class Ttype(object):
             return
 
         try:
-            option = "".join(option).lstrip(IS)
+            option = b"".join(option).lstrip(IS).decode()
         except TypeError:
+            # option is not on a suitable form for joining
             pass
 
         if self.ttype_step == 0:
@@ -99,25 +104,38 @@ class Ttype(object):
             # this is supposed to be the name of the client/terminal.
             # For clients not supporting the extended TTYPE
             # definition, subsequent calls will just repeat-return this.
-            clientname = option.upper()
+            try:
+                clientname = option.upper()
+            except AttributeError:
+                # malformed option (not a string)
+                clientname = "UNKNOWN"
+
             # use name to identify support for xterm256. Many of these
             # only support after a certain version, but all support
             # it since at least 4 years. We assume recent client here for now.
             xterm256 = False
             if clientname.startswith("MUDLET"):
                 # supports xterm256 stably since 1.1 (2010?)
-                xterm256 = clientname.split("MUDLET",1)[1].strip() >= "1.1"
-            else:
-                xterm256 = (clientname.startswith("XTERM") or
-                            clientname.endswith("-256COLOR") or
-                            clientname in ("ATLANTIS",      # > 0.9.9.0 (aug 2009)
-                                           "CMUD",          # > 3.04 (mar 2009)
-                                           "KILDCLIENT",    # > 2.2.0 (sep 2005)
-                                           "MUDLET",        # > beta 15 (sep 2009)
-                                           "MUSHCLIENT",    # > 4.02 (apr 2007)
-                                           "PUTTY",         # > 0.58 (apr 2005)
-                                           "BEIP",          # > 2.00.206 (late 2009) (BeipMu)
-                                           "POTATO"))       # > 2.00 (maybe earlier)
+                xterm256 = clientname.split("MUDLET", 1)[1].strip() >= "1.1"
+                self.protocol.protocol_flags["FORCEDENDLINE"] = False
+
+            if clientname.startswith("TINTIN++"):
+                self.protocol.protocol_flags["FORCEDENDLINE"] = True
+
+            if (clientname.startswith("XTERM") or
+                clientname.endswith("-256COLOR") or
+                clientname in (
+                           "ATLANTIS",      # > 0.9.9.0 (aug 2009)
+                           "CMUD",          # > 3.04 (mar 2009)
+                           "KILDCLIENT",    # > 2.2.0 (sep 2005)
+                           "MUDLET",        # > beta 15 (sep 2009)
+                           "MUSHCLIENT",    # > 4.02 (apr 2007)
+                           "PUTTY",         # > 0.58 (apr 2005)
+                           "BEIP",          # > 2.00.206 (late 2009) (BeipMu)
+                           "POTATO",        # > 2.00 (maybe earlier)
+                           "TINYFUGUE"      # > 4.x (maybe earlier)
+                           )):
+                    xterm256 = True
 
             # all clients supporting TTYPE at all seem to support ANSI
             self.protocol.protocol_flags['ANSI'] = True
@@ -128,10 +146,11 @@ class Ttype(object):
         elif self.ttype_step == 2:
             # this is a term capabilities flag
             term = option
+            tupper = term.upper()
             # identify xterm256 based on flag
-            xterm256 = (term.endswith("-256color")         # Apple Terminal, old Tintin
-                        or term.endswith("xterm") and      # old Tintin, Putty
-                        not term.endswith("-color"))
+            xterm256 = (tupper.endswith("-256COLOR") or        # Apple Terminal, old Tintin
+                        tupper.endswith("XTERM") and           # old Tintin, Putty
+                        not tupper.endswith("-COLOR"))
             if xterm256:
                 self.protocol.protocol_flags['ANSI'] = True
                 self.protocol.protocol_flags['XTERM256'] = xterm256
@@ -142,7 +161,7 @@ class Ttype(object):
         elif self.ttype_step == 3:
             # the MTTS bitstring identifying term capabilities
             if option.startswith("MTTS"):
-                option = option.split(" ")[1]
+                option = option[4:].strip()
                 if option.isdigit():
                     # a number - determine the actual capabilities
                     option = int(option)

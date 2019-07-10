@@ -221,16 +221,16 @@ msgstr "Aggiorna l'handler del canale."
 #: .\server\initial_setup.py:29
 msgid ""
 "\n"
-"Welcome to your new {wEvennia{n-based game! Visit http://www.evennia.com if you need\n"
+"Welcome to your new |wEvennia|n-based game! Visit http://www.evennia.com if you need\n"
 "help, want to contribute, report issues or just join the community.\n"
-"As Player #1 you can create a demo/tutorial area with {w@batchcommand tutorial_world.build{n.\n"
+"As Player #1 you can create a demo/tutorial area with |w@batchcommand tutorial_world.build|n.\n"
 "    "
 msgstr ""
 "\n"
-"Benvenuto al tuo nuovo gioco creato con {wEvennia{n! Visita http://www.evennia.com se ti\n"
+"Benvenuto al tuo nuovo gioco creato con |wEvennia|n! Visita http://www.evennia.com se ti\n"
 "serve aiuto, se vuoi collaborare, segnalare errori o se desideri unirti alla comunità online.\n"
 "In qualità di Giocatore #1 puoi creare un'area dimostrativa/tutorial digitando il comando:\n"
-"{w@batchcommand tutorial_world.build{n.\n"
+"|w@batchcommand tutorial_world.build|n.\n"
 "    "
 
 #: .\server\initial_setup.py:99
@@ -240,24 +240,6 @@ msgstr "Questo è l'Utente #1."
 #: .\server\initial_setup.py:108
 msgid "Limbo"
 msgstr "Limbo"
-
-#: .\server\portal\imc2.py:167
-#, python-format
-msgid "Whois reply from %(origin)s: %(msg)s"
-msgstr "Risposta Whois da %(origin)s: %(msg)s"
-
-#: .\server\portal\imc2.py:175
-#, python-format
-msgid "{c%(sender)s@%(origin)s{n {wpages (over IMC):{n %(msg)s"
-msgstr "{c%(sender)s@%(origin)s{n {wpages (over IMC):{n %(msg)s"
-
-#: .\server\portal\imc2.py:193
-msgid "IMC2 server rejected connection."
-msgstr "Il server IMC2 ha rifiutato la connessione."
-
-#: .\server\portal\imc2.py:201
-msgid "IMC2: Autosetup response found."
-msgstr "IMC2: Trovato responso di autosetup."
 
 #: .\server\sessionhandler.py:192
 #, python-format

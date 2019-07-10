@@ -3,22 +3,24 @@
 System commands
 
 """
-from __future__ import division
+
 
 import traceback
 import os
+import io
 import datetime
 import sys
 import django
 import twisted
-from time import time as timemeasure
+import time
 
 from django.conf import settings
 from evennia.server.sessionhandler import SESSIONS
 from evennia.scripts.models import ScriptDB
 from evennia.objects.models import ObjectDB
-from evennia.players.models import PlayerDB
-from evennia.utils import logger, utils, gametime, create, prettytable
+from evennia.accounts.models import AccountDB
+from evennia.utils import logger, utils, gametime, create, search
+from evennia.utils.eveditor import EvEditor
 from evennia.utils.evtable import EvTable
 from evennia.utils.utils import crop, class_from_module
 
@@ -39,14 +41,15 @@ class CmdReload(COMMAND_DEFAULT_CLASS):
     reload the server
 
     Usage:
-      @reload [reason]
+      reload [reason]
 
     This restarts the server. The Portal is not
-    affected. Non-persistent scripts will survive a @reload (use
-    @reset to purge) and at_reload() hooks will be called.
+    affected. Non-persistent scripts will survive a reload (use
+    reset to purge) and at_reload() hooks will be called.
     """
-    key = "@reload"
-    locks = "cmd:perm(reload) or perm(Immortals)"
+    key = "reload"
+    aliases = ['restart']
+    locks = "cmd:perm(reload) or perm(Developer)"
     help_category = "System"
 
     def func(self):
@@ -56,8 +59,8 @@ class CmdReload(COMMAND_DEFAULT_CLASS):
         reason = ""
         if self.args:
             reason = "(Reason: %s) " % self.args.rstrip(".")
-        SESSIONS.announce_all(" Server restarting %s..." % reason)
-        SESSIONS.server.shutdown(mode='reload')
+        SESSIONS.announce_all(" Server restart initiated %s..." % reason)
+        SESSIONS.portal_restart_server()
 
 
 class CmdReset(COMMAND_DEFAULT_CLASS):
@@ -65,24 +68,24 @@ class CmdReset(COMMAND_DEFAULT_CLASS):
     reset and reboot the server
 
     Usage:
-      @reset
+      reset
 
     Notes:
-      For normal updating you are recommended to use @reload rather
-      than this command. Use @shutdown for a complete stop of
+      For normal updating you are recommended to use reload rather
+      than this command. Use shutdown for a complete stop of
       everything.
 
     This emulates a cold reboot of the Server component of Evennia.
-    The difference to @shutdown is that the Server will auto-reboot
+    The difference to shutdown is that the Server will auto-reboot
     and that it does not affect the Portal, so no users will be
-    disconnected. Contrary to @reload however, all shutdown hooks will
+    disconnected. Contrary to reload however, all shutdown hooks will
     be called and any non-database saved scripts, ndb-attributes,
     cmdsets etc will be wiped.
 
     """
-    key = "@reset"
-    aliases = ['@reboot']
-    locks = "cmd:perm(reload) or perm(Immortals)"
+    key = "reset"
+    aliases = ['reboot']
+    locks = "cmd:perm(reload) or perm(Developer)"
     help_category = "System"
 
     def func(self):
@@ -90,7 +93,7 @@ class CmdReset(COMMAND_DEFAULT_CLASS):
         Reload the system.
         """
         SESSIONS.announce_all(" Server resetting/restarting ...")
-        SESSIONS.server.shutdown(mode='reset')
+        SESSIONS.portal_reset_server()
 
 
 class CmdShutdown(COMMAND_DEFAULT_CLASS):
@@ -99,16 +102,16 @@ class CmdShutdown(COMMAND_DEFAULT_CLASS):
     stop the server completely
 
     Usage:
-      @shutdown [announcement]
+      shutdown [announcement]
 
     Gracefully shut down both Server and Portal.
     """
-    key = "@shutdown"
-    locks = "cmd:perm(shutdown) or perm(Immortals)"
+    key = "shutdown"
+    locks = "cmd:perm(shutdown) or perm(Developer)"
     help_category = "System"
 
     def func(self):
-        "Define function"
+        """Define function"""
         # Only allow shutdown if caller has session
         if not self.caller.sessions.get():
             return
@@ -118,8 +121,104 @@ class CmdShutdown(COMMAND_DEFAULT_CLASS):
             announcement += "%s\n" % self.args
         logger.log_info('Server shutdown by %s.' % self.caller.name)
         SESSIONS.announce_all(announcement)
-        SESSIONS.server.shutdown(mode='shutdown')
         SESSIONS.portal_shutdown()
+
+
+def _py_load(caller):
+    return ""
+
+
+def _py_code(caller, buf):
+    """
+    Execute the buffer.
+    """
+    measure_time = caller.db._py_measure_time
+    client_raw = caller.db._py_clientraw
+    string = "Executing code%s ..." % (
+        " (measure timing)" if measure_time else "")
+    caller.msg(string)
+    _run_code_snippet(caller, buf, mode="exec",
+                      measure_time=measure_time,
+                      client_raw=client_raw,
+                      show_input=False)
+    return True
+
+
+def _py_quit(caller):
+    del caller.db._py_measure_time
+    caller.msg("Exited the code editor.")
+
+
+def _run_code_snippet(caller, pycode, mode="eval", measure_time=False,
+                      client_raw=False, show_input=True):
+    """
+    Run code and try to display information to the caller.
+
+    Args:
+        caller (Object): The caller.
+        pycode (str): The Python code to run.
+        measure_time (bool, optional): Should we measure the time of execution?
+        client_raw (bool, optional): Should we turn off all client-specific escaping?
+        show_input (bookl, optional): Should we display the input?
+
+    """
+    # Try to retrieve the session
+    session = caller
+    if hasattr(caller, "sessions"):
+        sessions = caller.sessions.all()
+
+    # import useful variables
+    import evennia
+    available_vars = {
+        'self': caller,
+        'me': caller,
+        'here': getattr(caller, "location", None),
+        'evennia': evennia,
+        'ev': evennia,
+        'inherits_from': utils.inherits_from,
+    }
+
+    if show_input:
+        for session in sessions:
+            try:
+                caller.msg(">>> %s" % pycode, session=session,
+                           options={"raw": True})
+            except TypeError:
+                caller.msg(">>> %s" % pycode, options={"raw": True})
+
+    try:
+        try:
+            pycode_compiled = compile(pycode, "", mode)
+        except Exception:
+            mode = "exec"
+            pycode_compiled = compile(pycode, "", mode)
+
+        duration = ""
+        if measure_time:
+            t0 = time.time()
+            ret = eval(pycode_compiled, {}, available_vars)
+            t1 = time.time()
+            duration = " (runtime ~ %.4f ms)" % ((t1 - t0) * 1000)
+        else:
+            ret = eval(pycode_compiled, {}, available_vars)
+
+        if mode == "eval":
+            ret = "%s%s" % (str(ret), duration)
+        else:
+            ret = " Done (use self.msg() if you want to catch output)%s" % duration
+    except Exception:
+        errlist = traceback.format_exc().split('\n')
+        if len(errlist) > 4:
+            errlist = errlist[4:]
+        ret = "\n".join("%s" % line for line in errlist if line)
+
+    for session in sessions:
+        try:
+            caller.msg(ret, session=session, options={"raw": True,
+                                                      "client_raw": client_raw})
+        except TypeError:
+            caller.msg(ret, options={"raw": True,
+                                     "client_raw": client_raw})
 
 
 class CmdPy(COMMAND_DEFAULT_CLASS):
@@ -127,102 +226,75 @@ class CmdPy(COMMAND_DEFAULT_CLASS):
     execute a snippet of python code
 
     Usage:
-      @py <cmd>
+      py <cmd>
+      py/edit
 
-    Switch:
+    Switches:
       time - output an approximate execution time for <cmd>
+      edit - open a code editor for multi-line code experimentation
+      clientraw - turn off all client-specific escaping. Note that this may
+        lead to different output depending on prototocol (such as angular brackets
+        being parsed as HTML in the webclient but not in telnet clients)
 
-    Separate multiple commands by ';'.  A few variables are made
-    available for convenience in order to offer access to the system
-    (you can import more at execution time).
+    Separate multiple commands by ';' or open the editor using the
+    /edit switch.  A few variables are made available for convenience
+    in order to offer access to the system (you can import more at
+    execution time).
 
-    Available variables in @py environment:
+    Available variables in py environment:
       self, me                   : caller
       here                       : caller.location
       ev                         : the evennia API
       inherits_from(obj, parent) : check object inheritance
 
     You can explore The evennia API from inside the game by calling
-    evennia.help(), evennia.managers.help() etc.
+    the `__doc__` property on entities:
+        py evennia.__doc__
+        py evennia.managers.__doc__
 
-    {rNote: In the wrong hands this command is a severe security risk.
-    It should only be accessible by trusted server admins/superusers.{n
+    |rNote: In the wrong hands this command is a severe security risk.
+    It should only be accessible by trusted server admins/superusers.|n
 
     """
-    key = "@py"
+    key = "py"
     aliases = ["!"]
-    locks = "cmd:perm(py) or perm(Immortals)"
+    switch_options = ("time", "edit", "clientraw")
+    locks = "cmd:perm(py) or perm(Developer)"
     help_category = "System"
 
     def func(self):
-        "hook function"
+        """hook function"""
 
         caller = self.caller
         pycode = self.args
 
+        if "edit" in self.switches:
+            caller.db._py_measure_time = "time" in self.switches
+            caller.db._py_clientraw = "clientraw" in self.switches
+            EvEditor(self.caller, loadfunc=_py_load, savefunc=_py_code,
+                     quitfunc=_py_quit, key="Python exec: :w  or :!", persistent=True,
+                     codefunc=_py_code)
+            return
+
         if not pycode:
-            string = "Usage: @py <code>"
+            string = "Usage: py <code>"
             self.msg(string)
             return
 
-        # check if caller is a player
-
-        # import useful variables
-        import evennia
-        available_vars = {'self': caller,
-                          'me': caller,
-                          'here': hasattr(caller, "location") and caller.location or None,
-                          'evennia': evennia,
-                          'ev': evennia,
-                          'inherits_from': utils.inherits_from}
-
-        try:
-            self.msg(">>> %s" % pycode, session=self.session, options={"raw":True})
-        except TypeError:
-            self.msg(">>> %s" % pycode, options={"raw":True})
-
-        mode = "eval"
-        try:
-            try:
-                pycode_compiled = compile(pycode, "", mode)
-            except Exception:
-                mode = "exec"
-                pycode_compiled = compile(pycode, "", mode)
-
-            duration = ""
-            if "time" in self.switches:
-                t0 = timemeasure()
-                ret = eval(pycode_compiled, {}, available_vars)
-                t1 = timemeasure()
-                duration = " (runtime ~ %.4f ms)" % ((t1 - t0) * 1000)
-            else:
-                ret = eval(pycode_compiled, {}, available_vars)
-            if mode == "eval":
-                ret = "%s%s" % (str(ret), duration)
-            else:
-                ret = " Done (use self.msg() if you want to catch output)%s" % duration
-        except Exception:
-            errlist = traceback.format_exc().split('\n')
-            if len(errlist) > 4:
-                errlist = errlist[4:]
-            ret = "\n".join("%s" % line for line in errlist if line)
-
-        try:
-            self.msg(ret, session=self.session, options={"raw":True})
-        except TypeError:
-            self.msg(ret, options={"raw":True})
-
+        _run_code_snippet(caller, self.args, measure_time="time" in self.switches,
+                          client_raw="clientraw" in self.switches)
 
 # helper function. Kept outside so it can be imported and run
 # by other commands.
 
+
 def format_script_list(scripts):
-    "Takes a list of scripts and formats the output."
+    """Takes a list of scripts and formats the output."""
     if not scripts:
         return "<No scripts>"
 
-    table = EvTable("{wdbref{n", "{wobj{n", "{wkey{n", "{wintval{n", "{wnext{n",
-                    "{wrept{n", "{wdb", "{wtypeclass{n", "{wdesc{n",
+    table = EvTable("|wdbref|n", "|wobj|n", "|wkey|n", "|wintval|n", "|wnext|n",
+                    "|wrept|n", "|wdb", "|wtypeclass|n", "|wdesc|n",
                     align='r', border="tablecols")
     for script in scripts:
         nextrep = script.time_until_next_repeat()
@@ -254,7 +326,7 @@ class CmdScripts(COMMAND_DEFAULT_CLASS):
     list and manage all running scripts
 
     Usage:
-      @scripts[/switches] [#dbref, key, script.path or <obj>]
+      scripts[/switches] [#dbref, key, script.path or <obj>]
 
     Switches:
       start - start a script (must supply a script path)
@@ -268,20 +340,20 @@ class CmdScripts(COMMAND_DEFAULT_CLASS):
     or #dbref. For using the /stop switch, a unique script #dbref is
     required since whole classes of scripts often have the same name.
 
-    Use @script for managing commands on objects.
+    Use script for managing commands on objects.
     """
-    key = "@scripts"
-    aliases = ["@globalscript", "@listscripts"]
-    locks = "cmd:perm(listscripts) or perm(Wizards)"
+    key = "scripts"
+    aliases = ["globalscript", "listscripts"]
+    switch_options = ("start", "stop", "kill", "validate")
+    locks = "cmd:perm(listscripts) or perm(Admin)"
     help_category = "System"
 
     def func(self):
-        "implement method"
+        """implement method"""
 
         caller = self.caller
         args = self.args
 
-        string = ""
         if args:
             if "start" in self.switches:
                 # global script-start mode
@@ -316,10 +388,7 @@ class CmdScripts(COMMAND_DEFAULT_CLASS):
 
         if self.switches and self.switches[0] in ('stop', 'del', 'delete', 'kill'):
             # we want to delete something
-            if not scripts:
-                string = "No scripts/objects matching '%s'. " % args
-                string += "Be more specific."
-            elif len(scripts) == 1:
+            if len(scripts) == 1:
                 # we have a unique match!
                 if 'kill' in self.switches:
                     string = "Killing script '%s'" % scripts[0].key
@@ -327,9 +396,9 @@ class CmdScripts(COMMAND_DEFAULT_CLASS):
                 else:
                     string = "Stopping script '%s'." % scripts[0].key
                     scripts[0].stop()
-                #import pdb
-                #pdb.set_trace()
-                ScriptDB.objects.validate() #just to be sure all is synced
+                # import pdb  # DEBUG
+                # pdb.set_trace()  # DEBUG
+                ScriptDB.objects.validate()  # just to be sure all is synced
             else:
                 # multiple matches.
                 string = "Multiple script matches. Please refine your search:\n"
@@ -350,46 +419,47 @@ class CmdObjects(COMMAND_DEFAULT_CLASS):
     statistics on objects in the database
 
     Usage:
-      @objects [<nr>]
+      objects [<nr>]
 
     Gives statictics on objects in database as well as
     a list of <nr> latest objects in database. If not
     given, <nr> defaults to 10.
     """
-    key = "@objects"
-    aliases = ["@listobjects", "@listobjs", '@stats', '@db']
-    locks = "cmd:perm(listobjects) or perm(Builders)"
+    key = "objects"
+    aliases = ["listobjects", "listobjs", 'stats', 'db']
+    locks = "cmd:perm(listobjects) or perm(Builder)"
     help_category = "System"
 
     def func(self):
-        "Implement the command"
+        """Implement the command"""
 
         caller = self.caller
-
-        if self.args and self.args.isdigit():
-            nlim = int(self.args)
-        else:
-            nlim = 10
-
+        nlim = int(self.args) if self.args and self.args.isdigit() else 10
         nobjs = ObjectDB.objects.count()
-        base_char_typeclass = settings.BASE_CHARACTER_TYPECLASS
-        nchars = ObjectDB.objects.filter(db_typeclass_path=base_char_typeclass).count()
-        nrooms = ObjectDB.objects.filter(db_location__isnull=True).exclude(db_typeclass_path=base_char_typeclass).count()
-        nexits = ObjectDB.objects.filter(db_location__isnull=False, db_destination__isnull=False).count()
+        Character = class_from_module(settings.BASE_CHARACTER_TYPECLASS)
+        nchars = Character.objects.all_family().count()
+        Room = class_from_module(settings.BASE_ROOM_TYPECLASS)
+        nrooms = Room.objects.all_family().count()
+        Exit = class_from_module(settings.BASE_EXIT_TYPECLASS)
+        nexits = Exit.objects.all_family().count()
         nother = nobjs - nchars - nrooms - nexits
-
-        nobjs = nobjs or 1 # fix zero-div error with empty database
+        nobjs = nobjs or 1  # fix zero-div error with empty database
 
         # total object sum table
-        totaltable = EvTable("{wtype{n", "{wcomment{n", "{wcount{n", "{w%%{n", border="table", align="l")
+        totaltable = self.styled_table("|wtype|n", "|wcomment|n", "|wcount|n", "|w%|n",
+                                      border="table", align="l")
         totaltable.align = 'l'
-        totaltable.add_row("Characters", "(BASE_CHARACTER_TYPECLASS)", nchars, "%.2f" % ((float(nchars) / nobjs) * 100))
-        totaltable.add_row("Rooms", "(location=None)", nrooms, "%.2f" % ((float(nrooms) / nobjs) * 100))
-        totaltable.add_row("Exits", "(destination!=None)", nexits, "%.2f" % ((float(nexits) / nobjs) * 100))
+        totaltable.add_row("Characters", "(BASE_CHARACTER_TYPECLASS + children)",
+                           nchars, "%.2f" % ((float(nchars) / nobjs) * 100))
+        totaltable.add_row("Rooms", "(BASE_ROOM_TYPECKLASS + children)",
+                           nrooms, "%.2f" % ((float(nrooms) / nobjs) * 100))
+        totaltable.add_row("Exits", "(BASE_EXIT_TYPECLASS + children)",
+                           nexits, "%.2f" % ((float(nexits) / nobjs) * 100))
         totaltable.add_row("Other", "", nother, "%.2f" % ((float(nother) / nobjs) * 100))
 
         # typeclass table
-        typetable = EvTable("{wtypeclass{n", "{wcount{n", "{w%%{n", border="table", align="l")
+        typetable = self.styled_table("|wtypeclass|n", "|wcount|n", "|w%|n",
+                                     border="table", align="l")
         typetable.align = 'l'
         dbtotals = ObjectDB.objects.object_totals()
         for path, count in dbtotals.items():
@@ -397,58 +467,114 @@ class CmdObjects(COMMAND_DEFAULT_CLASS):
 
         # last N table
         objs = ObjectDB.objects.all().order_by("db_date_created")[max(0, nobjs - nlim):]
-        latesttable = EvTable("{wcreated{n", "{wdbref{n", "{wname{n", "{wtypeclass{n", align="l", border="table")
+        latesttable = self.styled_table("|wcreated|n", "|wdbref|n", "|wname|n",
+                                       "|wtypeclass|n", align="l", border="table")
         latesttable.align = 'l'
         for obj in objs:
             latesttable.add_row(utils.datetime_format(obj.date_created),
                                 obj.dbref, obj.key, obj.path)
 
-        string = "\n{wObject subtype totals (out of %i Objects):{n\n%s" % (nobjs, totaltable)
-        string += "\n{wObject typeclass distribution:{n\n%s" % typetable
-        string += "\n{wLast %s Objects created:{n\n%s" % (min(nobjs, nlim), latesttable)
+        string = "\n|wObject subtype totals (out of %i Objects):|n\n%s" % (nobjs, totaltable)
+        string += "\n|wObject typeclass distribution:|n\n%s" % typetable
+        string += "\n|wLast %s Objects created:|n\n%s" % (min(nobjs, nlim), latesttable)
         caller.msg(string)
 
 
-class CmdPlayers(COMMAND_DEFAULT_CLASS):
+class CmdAccounts(COMMAND_DEFAULT_CLASS):
     """
-    list all registered players
+    Manage registered accounts
 
     Usage:
-      @players [nr]
+      accounts [nr]
+      accounts/delete <name or #id> [: reason]
 
-    Lists statistics about the Players registered with the game.
-    It will list the <nr> amount of latest registered players
+    Switches:
+      delete    - delete an account from the server
+
+    By default, lists statistics about the Accounts registered with the game.
+    It will list the <nr> amount of latest registered accounts
     If not given, <nr> defaults to 10.
     """
-    key = "@players"
-    aliases = ["@listplayers"]
-    locks = "cmd:perm(listplayers) or perm(Wizards)"
+    key = "accounts"
+    aliases = ["account", "listaccounts"]
+    switch_options = ("delete", )
+    locks = "cmd:perm(listaccounts) or perm(Admin)"
     help_category = "System"
 
     def func(self):
-        "List the players"
+        """List the accounts"""
 
         caller = self.caller
+        args = self.args
+
+        if "delete" in self.switches:
+            account = getattr(caller, "account")
+            if not account or not account.check_permstring("Developer"):
+                caller.msg("You are not allowed to delete accounts.")
+                return
+            if not args:
+                caller.msg("Usage: accounts/delete <name or #id> [: reason]")
+                return
+            reason = ""
+            if ":" in args:
+                args, reason = [arg.strip() for arg in args.split(":", 1)]
+            # We use account_search since we want to be sure to find also accounts
+            # that lack characters.
+            accounts = search.account_search(args)
+            if not accounts:
+                self.msg("Could not find an account by that name.")
+                return
+            if len(accounts) > 1:
+                string = "There were multiple matches:\n"
+                string += "\n".join(" %s %s" % (account.id, account.key) for account in accounts)
+                self.msg(string)
+                return
+            account = accounts.first()
+            if not account.access(caller, "delete"):
+                self.msg("You don't have the permissions to delete that account.")
+                return
+            username = account.username
+            # ask for confirmation
+            confirm = ("It is often better to block access to an account rather than to delete it. "
+                       "|yAre you sure you want to permanently delete "
+                       "account '|n{}|y'|n yes/[no]?".format(username))
+            answer = yield(confirm)
+            if answer.lower() not in ('y', 'yes'):
+                caller.msg("Canceled deletion.")
+                return
+
+            # Boot the account then delete it.
+            self.msg("Informing and disconnecting account ...")
+            string = "\nYour account '%s' is being *permanently* deleted.\n" % username
+            if reason:
+                string += " Reason given:\n  '%s'" % reason
+            account.msg(string)
+            logger.log_sec("Account Deleted: %s (Reason: %s, Caller: %s, IP: %s)." % (account, reason, caller, self.session.address))
+            account.delete()
+            self.msg("Account %s was successfully deleted." % username)
+            return
+
+        # No switches, default to displaying a list of accounts.
         if self.args and self.args.isdigit():
             nlim = int(self.args)
         else:
             nlim = 10
 
-        nplayers = PlayerDB.objects.count()
+        naccounts = AccountDB.objects.count()
 
         # typeclass table
-        dbtotals = PlayerDB.objects.object_totals()
-        typetable = EvTable("{wtypeclass{n", "{wcount{n", "{w%%{n", border="cells", align="l")
+        dbtotals = AccountDB.objects.object_totals()
+        typetable = self.styled_table("|wtypeclass|n", "|wcount|n", "|w%%|n", border="cells", align="l")
         for path, count in dbtotals.items():
-            typetable.add_row(path, count, "%.2f" % ((float(count) / nplayers) * 100))
+            typetable.add_row(path, count, "%.2f" % ((float(count) / naccounts) * 100))
         # last N table
-        plyrs = PlayerDB.objects.all().order_by("db_date_created")[max(0, nplayers - nlim):]
-        latesttable = EvTable("{wcreated{n", "{wdbref{n", "{wname{n", "{wtypeclass{n", border="cells", align="l")
+        plyrs = AccountDB.objects.all().order_by("db_date_created")[max(0, naccounts - nlim):]
+        latesttable = self.styled_table("|wcreated|n", "|wdbref|n", "|wname|n", "|wtypeclass|n", border="cells", align="l")
         for ply in plyrs:
             latesttable.add_row(utils.datetime_format(ply.date_created), ply.dbref, ply.key, ply.path)
 
-        string = "\n{wPlayer typeclass distribution:{n\n%s" % typetable
-        string += "\n{wLast %s Players created:{n\n%s" % (min(nplayers, nlim), latesttable)
+        string = "\n|wAccount typeclass distribution:|n\n%s" % typetable
+        string += "\n|wLast %s Accounts created:|n\n%s" % (min(naccounts, nlim), latesttable)
         caller.msg(string)
 
 
@@ -457,7 +583,7 @@ class CmdService(COMMAND_DEFAULT_CLASS):
     manage system services
 
     Usage:
-      @service[/switch] <service>
+      service[/switch] <service>
 
     Switches:
       list   - shows all available services (default)
@@ -472,19 +598,20 @@ class CmdService(COMMAND_DEFAULT_CLASS):
     in the list.
     """
 
-    key = "@service"
-    aliases = ["@services"]
-    locks = "cmd:perm(service) or perm(Immortals)"
+    key = "service"
+    aliases = ["services"]
+    switch_options = ("list", "start", "stop", "delete")
+    locks = "cmd:perm(service) or perm(Developer)"
     help_category = "System"
 
     def func(self):
-        "Implement command"
+        """Implement command"""
 
         caller = self.caller
         switches = self.switches
 
         if switches and switches[0] not in ("list", "start", "stop", "delete"):
-            caller.msg("Usage: @service/<list|start|stop|delete> [servicename]")
+            caller.msg("Usage: service/<list|start|stop|delete> [servicename]")
             return
 
         # get all services
@@ -493,10 +620,9 @@ class CmdService(COMMAND_DEFAULT_CLASS):
         if not switches or switches[0] == "list":
             # Just display the list of installed services and their
             # status, then exit.
-            table = prettytable.PrettyTable(["{wService{n (use @services/start|stop|delete)", "{wstatus"])
-            table.align = 'l'
+            table = self.styled_table("|wService|n (use services/start|stop|delete)", "|wstatus", align="l")
             for service in service_collection.services:
-                table.add_row([service.name, service.running and "{gRunning" or "{rNot Running"])
+                table.add_row(service.name, service.running and "|gRunning" or "|rNot Running")
             caller.msg(str(table))
             return
 
@@ -506,7 +632,7 @@ class CmdService(COMMAND_DEFAULT_CLASS):
             service = service_collection.getServiceNamed(self.args)
         except Exception:
             string = 'Invalid service name. This command is case-sensitive. '
-            string += 'See @service/list for valid service name (enter the full name exactly).'
+            string += 'See service/list for valid service name (enter the full name exactly).'
             caller.msg(string)
             return
 
@@ -538,7 +664,7 @@ class CmdService(COMMAND_DEFAULT_CLASS):
             return
 
         if switches[0] == "start":
-            #Starts a service.
+            # Attempt to start a service.
             if service.running:
                 caller.msg('That service is already running.')
                 return
@@ -551,39 +677,39 @@ class CmdAbout(COMMAND_DEFAULT_CLASS):
     show Evennia info
 
     Usage:
-      @about
+      about
 
     Display info about the game engine.
     """
 
-    key = "@about"
-    aliases = "@version"
+    key = "about"
+    aliases = "version"
     locks = "cmd:all()"
     help_category = "System"
 
     def func(self):
-        "Show the version"
+        """Display information about server or target"""
 
         string = """
-         {cEvennia{n %s{n
-         MUD/MUX/MU* development system
+         |cEvennia|n {version}|n
+         MU* development system
 
-         {wLicence{n BSD 3-Clause Licence
-         {wWeb{n http://www.evennia.com
-         {wIrc{n #evennia on FreeNode
-         {wForum{n http://www.evennia.com/discussions
-         {wMaintainer{n (2010-)   Griatch (griatch AT gmail DOT com)
-         {wMaintainer{n (2006-10) Greg Taylor
+         |wLicence|n https://opensource.org/licenses/BSD-3-Clause
+         |wWeb|n http://www.evennia.com
+         |wIrc|n #evennia on irc.freenode.net:6667
+         |wForum|n http://www.evennia.com/discussions
+         |wMaintainer|n (2010-)   Griatch (griatch AT gmail DOT com)
+         |wMaintainer|n (2006-10) Greg Taylor
 
-         {wOS{n %s
-         {wPython{n %s
-         {wTwisted{n %s
-         {wDjango{n %s
-        """ % (utils.get_evennia_version(),
-               os.name,
-               sys.version.split()[0],
-               twisted.version.short(),
-               django.get_version())
+         |wOS|n {os}
+         |wPython|n {python}
+         |wTwisted|n {twisted}
+         |wDjango|n {django}
+        """.format(version=utils.get_evennia_version(),
+                   os=os.name,
+                   python=sys.version.split()[0],
+                   twisted=twisted.version.short(),
+                   django=django.get_version())
         self.caller.msg(string)
 
 
@@ -592,25 +718,32 @@ class CmdTime(COMMAND_DEFAULT_CLASS):
     show server time statistics
 
     Usage:
-      @time
+      time
 
     List Server time statistics such as uptime
     and the current time stamp.
     """
-    key = "@time"
-    aliases = "@uptime"
-    locks = "cmd:perm(time) or perm(Players)"
+    key = "time"
+    aliases = "uptime"
+    locks = "cmd:perm(time) or perm(Player)"
     help_category = "System"
 
     def func(self):
-        "Show server time data in a table."
-        table = prettytable.PrettyTable(["{wserver time statistic","{wtime"])
-        table.align = 'l'
-        table.add_row(["Current server uptime", utils.time_format(gametime.uptime(), 3)])
-        table.add_row(["Total server running time", utils.time_format(gametime.runtime(), 2)])
-        table.add_row(["Total in-game time (realtime x %g)" % (gametime.TIMEFACTOR), utils.time_format(gametime.gametime(), 2)])
-        table.add_row(["Server time stamp", datetime.datetime.now()])
-        self.caller.msg(str(table))
+        """Show server time data in a table."""
+        table1 = self.styled_table("|wServer time", "", align="l", width=78)
+        table1.add_row("Current uptime", utils.time_format(gametime.uptime(), 3))
+        table1.add_row("Portal uptime", utils.time_format(gametime.portal_uptime(), 3))
+        table1.add_row("Total runtime", utils.time_format(gametime.runtime(), 2))
+        table1.add_row("First start", datetime.datetime.fromtimestamp(gametime.server_epoch()))
+        table1.add_row("Current time", datetime.datetime.now())
+        table1.reformat_column(0, width=30)
+        table2 = self.styled_table("|wIn-Game time", "|wReal time x %g" % gametime.TIMEFACTOR, align="l", width=77, border_top=0)
+        epochtxt = "Epoch (%s)" % ("from settings" if settings.TIME_GAME_EPOCH else "server start")
+        table2.add_row(epochtxt, datetime.datetime.fromtimestamp(gametime.game_epoch()))
+        table2.add_row("Total time passed:", utils.time_format(gametime.gametime(), 2))
+        table2.add_row("Current time ", datetime.datetime.fromtimestamp(gametime.gametime(absolute=True)))
+        table2.reformat_column(0, width=30)
+        self.caller.msg(str(table1) + "\n" + str(table2))
 
 
 class CmdServerLoad(COMMAND_DEFAULT_CLASS):
@@ -618,9 +751,9 @@ class CmdServerLoad(COMMAND_DEFAULT_CLASS):
     show server load and memory statistics
 
     Usage:
-       @server[/mem]
+       server[/mem]
 
-    Switch:
+    Switches:
         mem - return only a string of the current memory usage
         flushmem - flush the idmapper cache
 
@@ -630,32 +763,33 @@ class CmdServerLoad(COMMAND_DEFAULT_CLASS):
 
     Some Important statistics in the table:
 
-    {wServer load{n is an average of processor usage. It's usually
+    |wServer load|n is an average of processor usage. It's usually
     between 0 (no usage) and 1 (100% usage), but may also be
     temporarily higher if your computer has multiple CPU cores.
 
-    The {wResident/Virtual memory{n displays the total memory used by
+    The |wResident/Virtual memory|n displays the total memory used by
     the server process.
 
-    Evennia {wcaches{n all retrieved database entities when they are
+    Evennia |wcaches|n all retrieved database entities when they are
     loaded by use of the idmapper functionality. This allows Evennia
     to maintain the same instances of an entity and allowing
     non-persistent storage schemes. The total amount of cached objects
     are displayed plus a breakdown of database object types.
 
-    The {wflushmem{n switch allows to flush the object cache. Please
+    The |wflushmem|n switch allows to flush the object cache. Please
     note that due to how Python's memory management works, releasing
     caches may not show you a lower Residual/Virtual memory footprint,
     the released memory will instead be re-used by the program.
 
     """
-    key = "@server"
-    aliases = ["@serverload", "@serverprocess"]
-    locks = "cmd:perm(list) or perm(Immortals)"
+    key = "server"
+    aliases = ["serverload", "serverprocess"]
+    switch_options = ("mem", "flushmem")
+    locks = "cmd:perm(list) or perm(Developer)"
     help_category = "System"
 
     def func(self):
-        "Show list."
+        """Show list."""
 
         global _IDMAPPER
         if not _IDMAPPER:
@@ -668,7 +802,7 @@ class CmdServerLoad(COMMAND_DEFAULT_CLASS):
             now, _ = _IDMAPPER.cache_size()
             string = "The Idmapper cache freed |w{idmapper}|n database objects.\n" \
                      "The Python garbage collector freed |w{gc}|n Python instances total."
-            self.caller.msg(string.format(idmapper=(prev-now), gc=nflushed))
+            self.caller.msg(string.format(idmapper=(prev - now), gc=nflushed))
             return
 
         # display active processes
@@ -689,21 +823,21 @@ class CmdServerLoad(COMMAND_DEFAULT_CLASS):
             if has_psutil:
                 loadavg = psutil.cpu_percent()
                 _mem = psutil.virtual_memory()
-                rmem = _mem.used  / (1000.0 * 1000)
+                rmem = _mem.used / (1000.0 * 1000)
                 pmem = _mem.percent
 
                 if "mem" in self.switches:
-                    string = "Total computer memory usage: {w%g{n MB (%g%%)"
+                    string = "Total computer memory usage: |w%g|n MB (%g%%)"
                     self.caller.msg(string % (rmem, pmem))
                     return
                 # Display table
-                loadtable = EvTable("property", "statistic", align="l")
+                loadtable = self.styled_table("property", "statistic", align="l")
                 loadtable.add_row("Total CPU load", "%g %%" % loadavg)
-                loadtable.add_row("Total computer memory usage","%g MB (%g%%)" % (rmem, pmem))
+                loadtable.add_row("Total computer memory usage", "%g MB (%g%%)" % (rmem, pmem))
                 loadtable.add_row("Process ID", "%g" % pid),
             else:
                 loadtable = "Not available on Windows without 'psutil' library " \
-                            "(install with {wpip install psutil{n)."
+                            "(install with |wpip install psutil|n)."
 
         else:
             # Linux / BSD (OSX) - proper pid-based statistics
@@ -715,61 +849,64 @@ class CmdServerLoad(COMMAND_DEFAULT_CLASS):
             loadavg = os.getloadavg()[0]
             rmem = float(os.popen('ps -p %d -o %s | tail -1' % (pid, "rss")).read()) / 1000.0  # resident memory
             vmem = float(os.popen('ps -p %d -o %s | tail -1' % (pid, "vsz")).read()) / 1000.0  # virtual memory
-            pmem = float(os.popen('ps -p %d -o %s | tail -1' % (pid, "%mem")).read())  # percent of resident memory to total
+            pmem = float(os.popen('ps -p %d -o %s | tail -1' % (pid, "%mem")).read())  # % of resident memory to total
             rusage = _RESOURCE.getrusage(_RESOURCE.RUSAGE_SELF)
 
             if "mem" in self.switches:
-                string = "Memory usage: RMEM: {w%g{n MB (%g%%), " \
-                         " VMEM (res+swap+cache): {w%g{n MB."
+                string = "Memory usage: RMEM: |w%g|n MB (%g%%), VMEM (res+swap+cache): |w%g|n MB."
                 self.caller.msg(string % (rmem, pmem, vmem))
                 return
 
-            loadtable = EvTable("property", "statistic", align="l")
+            loadtable = self.styled_table("property", "statistic", align="l")
             loadtable.add_row("Server load (1 min)", "%g" % loadavg)
             loadtable.add_row("Process ID", "%g" % pid),
-            loadtable.add_row("Memory usage","%g MB (%g%%)" % (rmem, pmem))
+            loadtable.add_row("Memory usage", "%g MB (%g%%)" % (rmem, pmem))
             loadtable.add_row("Virtual address space", "")
-            loadtable.add_row("{x(resident+swap+caching){n", "%g MB" % vmem)
-            loadtable.add_row("CPU time used (total)", "%s (%gs)" % (utils.time_format(rusage.ru_utime), rusage.ru_utime))
-            loadtable.add_row("CPU time used (user)", "%s (%gs)" % (utils.time_format(rusage.ru_stime), rusage.ru_stime))
-            loadtable.add_row("Page faults", "%g hard,  %g soft, %g swapouts" % (rusage.ru_majflt, rusage.ru_minflt, rusage.ru_nswap))
+            loadtable.add_row("|x(resident+swap+caching)|n", "%g MB" % vmem)
+            loadtable.add_row("CPU time used (total)", "%s (%gs)"
+                              % (utils.time_format(rusage.ru_utime), rusage.ru_utime))
+            loadtable.add_row("CPU time used (user)", "%s (%gs)"
+                              % (utils.time_format(rusage.ru_stime), rusage.ru_stime))
+            loadtable.add_row("Page faults", "%g hard,  %g soft, %g swapouts"
+                              % (rusage.ru_majflt, rusage.ru_minflt, rusage.ru_nswap))
             loadtable.add_row("Disk I/O", "%g reads, %g writes" % (rusage.ru_inblock, rusage.ru_oublock))
             loadtable.add_row("Network I/O", "%g in, %g out" % (rusage.ru_msgrcv, rusage.ru_msgsnd))
-            loadtable.add_row("Context switching", "%g vol, %g forced, %g signals" % (rusage.ru_nvcsw, rusage.ru_nivcsw, rusage.ru_nsignals))
-
+            loadtable.add_row("Context switching", "%g vol, %g forced, %g signals"
+                              % (rusage.ru_nvcsw, rusage.ru_nivcsw, rusage.ru_nsignals))
 
         # os-generic
 
-        string = "{wServer CPU and Memory load:{n\n%s" % loadtable
+        string = "|wServer CPU and Memory load:|n\n%s" % loadtable
 
         # object cache count (note that sys.getsiseof is not called so this works for pypy too.
         total_num, cachedict = _IDMAPPER.cache_size()
         sorted_cache = sorted([(key, num) for key, num in cachedict.items() if num > 0],
-                                key=lambda tup: tup[1], reverse=True)
-        memtable = EvTable("entity name", "number", "idmapper %", align="l")
+                              key=lambda tup: tup[1], reverse=True)
+        memtable = self.styled_table("entity name", "number", "idmapper %", align="l")
         for tup in sorted_cache:
             memtable.add_row(tup[0], "%i" % tup[1], "%.2f" % (float(tup[1]) / total_num * 100))
 
-        string += "\n{w Entity idmapper cache:{n %i items\n%s" % (total_num, memtable)
+        string += "\n|w Entity idmapper cache:|n %i items\n%s" % (total_num, memtable)
 
         # return to caller
         self.caller.msg(string)
+
 
 class CmdTickers(COMMAND_DEFAULT_CLASS):
     """
     View running tickers
 
     Usage:
-      @tickers
+      tickers
 
     Note: Tickers are created, stopped and manipulated in Python code
     using the TickerHandler. This is merely a convenience function for
     inspecting the current status.
 
     """
-    key = "@tickers"
+    key = "tickers"
     help_category = "System"
-    locks = "cmd:perm(tickers) or perm(Builders)"
+    locks = "cmd:perm(tickers) or perm(Builder)"
 
     def func(self):
         from evennia import TICKER_HANDLER
@@ -777,16 +914,12 @@ class CmdTickers(COMMAND_DEFAULT_CLASS):
         if not all_subs:
             self.caller.msg("No tickers are currently active.")
             return
-        table = EvTable("interval (s)", "object", "path/methodname", "idstring", "db")
+        table = self.styled_table("interval (s)", "object", "path/methodname", "idstring", "db")
         for sub in all_subs:
             table.add_row(sub[3],
-                          "%s%s" % (sub[0] or "[None]", sub[0] and " (#%s)" % (sub[0].id if hasattr(sub[0], "id") else "") or ""),
+                          "%s%s" % (sub[0] or "[None]",
+                                    sub[0] and " (#%s)" % (sub[0].id if hasattr(sub[0], "id") else "") or ""),
                           sub[1] if sub[1] else sub[2],
                           sub[4] or "[Unset]",
                           "*" if sub[5] else "-")
-        self.caller.msg("|wActive tickers|n:\n" + unicode(table))
-
-
-
-
-
+        self.caller.msg("|wActive tickers|n:\n" + str(table))
